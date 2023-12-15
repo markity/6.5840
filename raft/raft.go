@@ -154,6 +154,7 @@ type AppendEntriesRequest struct {
 
 type AppendEntriesReply struct {
 	ID             int
+	ReqTerm        int
 	Term           int
 	PreIndex       int
 	Success        bool
@@ -317,13 +318,6 @@ func (rf *Raft) sendAppendEntriesReply(server int, args *AppendEntriesReply) {
 // the leader.
 func (rf *Raft) Start(command interface{}) (idx int, term int, isLeader bool) {
 	// 防止send to channel panic
-	defer func() {
-		if recover() != nil {
-			idx = -1
-			term = -1
-			isLeader = false
-		}
-	}()
 
 	c := make(chan SendCmdRespInfo)
 	rf.sendCmdChan <- SendCmdChanInfo{
@@ -395,13 +389,21 @@ func StateMachine(rf *Raft) {
 			rf.Debug("dead")
 			rf.reqDeadOK <- struct{}{}
 			// 测试用例会在raft dead后发start, 需要避免问题我采取了个折中的方案
-			close(rf.sendCmdChan)
+			go func() {
+				for {
+					c := <-rf.sendCmdChan
+					c.Resp <- SendCmdRespInfo{Term: -1, Index: -1, IsLeader: false}
+				}
+			}()
 			return
 		case <-rf.reqGetState:
 			rf.Debug("rf.reqGetState")
-			go func() {
-				rf.getStateChan <- GetStateInfo{Term: rf.state.PersistInfo.Term, Isleader: rf.state.State == "leader"}
-			}()
+			go func(t int, isLeader bool) {
+				rf.getStateChan <- GetStateInfo{
+					Term:     t,
+					Isleader: isLeader,
+				}
+			}(rf.state.Term, rf.state.State == "leader")
 		// 选举超时timer
 		case <-rf.timer:
 			rf.Debug("timeout")
@@ -683,12 +685,14 @@ func StateMachine(rf *Raft) {
 				rf.Debug("entries = %v", entries)
 
 				// 如果对方的term小于自己, 那么久直接拒绝日志, 对方收到term后会立刻回退到follower, 此时不用更新timer
-				if rf.state.PersistInfo.Term > val.Term {
+				if rf.state.Term > val.Term {
 					rf.Debug("got AppendEntriesRequest from %v, but it's term(%v) < self, sending reply to make it a leader", val.LeaderID, val.Term)
+					// 经测试, 必须包含ReqTerm才能保证正确性
 					go func(t int) {
 						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
 							Term:    t,
 							Success: false,
+							ReqTerm: val.Term,
 						})
 					}(rf.state.Term)
 					break
@@ -712,6 +716,7 @@ func StateMachine(rf *Raft) {
 
 				// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
 				if _, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex); !ok {
+					rf.Debug("no preLog in logs, refusing")
 					go func(t int) {
 						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
 							ID:             rf.me,
@@ -720,6 +725,7 @@ func StateMachine(rf *Raft) {
 							Success:        false,
 							NLogsInRequest: len(val.Entries),
 							ConflictIndex:  -1,
+							ReqTerm:        val.Term,
 						})
 					}(rf.state.Term)
 					break
@@ -746,6 +752,7 @@ func StateMachine(rf *Raft) {
 							Success:        false,
 							NLogsInRequest: len(val.Entries),
 							ConflictIndex:  i + 1,
+							ReqTerm:        val.Term,
 						})
 					}(rf.state.Term)
 					break
@@ -780,75 +787,87 @@ func StateMachine(rf *Raft) {
 						PreIndex:       val.PrevLogIndex,
 						Success:        true,
 						NLogsInRequest: len(entries),
+						ReqTerm:        val.Term,
 					})
 				}(rf.state.Term)
 			case *AppendEntriesReply:
 				// 此时自己的term>=对方的term
 				// 只有leader理这个信息
-				switch rf.state.State {
-				case "leader":
-					// 来的消息是其它朝代的, 也许是自己之前当过leader, 然会reply滞后了
-					//		这种情况不用管, 之后的心跳会同步它的
-					if val.Term < rf.state.Term {
-						break
-					}
+				if rf.state.State != "leader" {
+					break
+				}
 
-					// 过滤过时的ack
-					if val.PreIndex != rf.state.Logs.At(rf.state.NextLogIndex[val.ID]-1).LogIndex {
-						break
-					}
+				if val.ReqTerm != rf.state.Term {
+					break
+				}
 
-					if !val.Success {
-						if val.ConflictIndex == -1 {
-							j := val.PreIndex
-							for j >= 0 && rf.state.Logs[j].LogTerm == rf.state.Logs.At(val.PreIndex).LogTerm {
-								j--
-							}
-							rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], j+1)
-						} else {
-							rf.state.NextLogIndex[val.ID] = min(val.ConflictIndex, rf.state.NextLogIndex[val.ID])
+				// 来的消息是其它朝代的, 也许是自己之前当过leader, 然会reply滞后了
+				//		这种情况不用管, 之后的心跳会同步它的
+				if val.Term < rf.state.Term {
+					break
+				}
+
+				// 过滤过时的ack
+				if val.PreIndex != rf.state.Logs.At(rf.state.NextLogIndex[val.ID]-1).LogIndex {
+					break
+				}
+
+				if !val.Success {
+					if val.ConflictIndex == -1 {
+						j := val.PreIndex
+						for j >= 0 && rf.state.Logs[j].LogTerm == rf.state.Logs.At(val.PreIndex).LogTerm {
+							j--
 						}
-						rf.Debug("got refuse from %v, now nextIndex=%v", val.ID, rf.state.NextLogIndex[val.ID])
-						rf.LeaderSendLogs(val.ID)
-						// success, 那么加nextIndex, 加matchIndex
+						rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], j+1)
+						rf.Debug("case2, j+1=%v", j+1)
 					} else {
-						nextLogMaybeSet := val.PreIndex + val.NLogsInRequest + 1
-						rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
-						rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
-
-						if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
-							rf.LeaderSendLogs(val.ID)
+						rf.state.NextLogIndex[val.ID] = min(val.ConflictIndex, rf.state.NextLogIndex[val.ID])
+						rf.Debug("case2, ConflictIndex=%v", val.ConflictIndex)
+						if rf.state.NextLogIndex[val.ID] == 0 {
+							rf.Debug("%v", val)
+							panic("checkme")
 						}
-						rf.Debug("set server %v nextIndex = %v", val.ID, rf.state.NextLogIndex[val.ID])
+					}
+					rf.Debug("got refuse from %v, now nextIndex=%v", val.ID, rf.state.NextLogIndex[val.ID])
+					rf.LeaderSendLogs(val.ID)
+					// success, 那么加nextIndex, 加matchIndex
+				} else {
+					nextLogMaybeSet := val.PreIndex + val.NLogsInRequest + 1
+					rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
+					rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
 
-						// If there exists an N such that N > commitIndex,
-						//  a majority of matchIndex[i] ≥ N, and log[N].
-						// term == currentTerm: set commitIndex = N
-						// TODO: 现在需要判断某个index的日志是否可以提交了, 更新commitIndex
-						sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
-						copy(sortedMatchIndex, rf.state.MatchIndex)
-						sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
-						sort.Ints(sortedMatchIndex)
-						N := sortedMatchIndex[len(rf.peers)/2]
-						if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs[N].LogTerm == rf.state.PersistInfo.Term {
-							oldCommitIndex := rf.state.CommitIndex
-							rf.state.CommitIndex = N
-							flag := false
-							rf.Debug("commit log, matchIdx=%v N=%v oldCommitIndex=%v, now is %v",
-								rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
-							for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
-								flag = true
-								msg := ApplyMsg{
-									CommandValid: true,
-									Command:      rf.state.PersistInfo.Logs[i].Command,
-									CommandIndex: i,
-								}
-								rf.Debug("applied log: %v", msg)
-								rf.applyQueue.Push(msg)
+					if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
+						rf.LeaderSendLogs(val.ID)
+					}
+					rf.Debug("set server %v nextIndex = %v", val.ID, rf.state.NextLogIndex[val.ID])
+
+					// If there exists an N such that N > commitIndex,
+					//  a majority of matchIndex[i] ≥ N, and log[N].
+					// term == currentTerm: set commitIndex = N
+					// TODO: 现在需要判断某个index的日志是否可以提交了, 更新commitIndex
+					sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
+					copy(sortedMatchIndex, rf.state.MatchIndex)
+					sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
+					sort.Ints(sortedMatchIndex)
+					N := sortedMatchIndex[len(rf.peers)/2]
+					if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs[N].LogTerm == rf.state.PersistInfo.Term {
+						oldCommitIndex := rf.state.CommitIndex
+						rf.state.CommitIndex = N
+						flag := false
+						rf.Debug("commit log, matchIdx=%v N=%v oldCommitIndex=%v, now is %v",
+							rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
+						for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
+							flag = true
+							msg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.state.PersistInfo.Logs[i].Command,
+								CommandIndex: i,
 							}
-							if !flag {
-								panic("checkme")
-							}
+							rf.Debug("applied log: %v", msg)
+							rf.applyQueue.Push(msg)
+						}
+						if !flag {
+							panic("checkme")
 						}
 					}
 				}
