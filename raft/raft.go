@@ -136,6 +136,7 @@ type RequestVoteRequest struct {
 }
 
 type RequestVoteReply struct {
+	ReqTerm     int
 	Term        int
 	VoteGranted bool
 }
@@ -546,6 +547,10 @@ func StateMachine(rf *Raft) {
 				set currentTerm = T, convert to follower (§5.1)
 				*/
 
+				if val.ReqTerm != rf.state.Term {
+					break
+				}
+
 				// 如果是过去的消息, 直接无视
 				if val.Term != rf.state.PersistInfo.Term {
 					break
@@ -594,6 +599,7 @@ func StateMachine(rf *Raft) {
 						rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 							Term:        t,
 							VoteGranted: false,
+							ReqTerm:     val.Term,
 						})
 					}(rf.state.Term)
 				// 但是作为follower, 自己的term>=val.Term, 如果自己的term > 对方的term, 那么拒绝
@@ -609,6 +615,7 @@ func StateMachine(rf *Raft) {
 							rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 								Term:        t,
 								VoteGranted: false,
+								ReqTerm:     val.Term,
 							})
 						}(rf.state.Term)
 					} else {
@@ -629,6 +636,7 @@ func StateMachine(rf *Raft) {
 									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 										Term:        t,
 										VoteGranted: false,
+										ReqTerm:     val.Term,
 									})
 								}(rf.state.Term)
 							} else {
@@ -639,6 +647,7 @@ func StateMachine(rf *Raft) {
 									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 										Term:        t,
 										VoteGranted: true,
+										ReqTerm:     val.Term,
 									})
 								}(rf.state.Term)
 
@@ -655,6 +664,7 @@ func StateMachine(rf *Raft) {
 								rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 									Term:        t,
 									VoteGranted: false,
+									ReqTerm:     val.Term,
 								})
 							}(rf.state.Term)
 						}
@@ -666,6 +676,7 @@ func StateMachine(rf *Raft) {
 						rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 							Term:        t,
 							VoteGranted: false,
+							ReqTerm:     val.Term,
 						})
 					}(rf.state.Term)
 				}
