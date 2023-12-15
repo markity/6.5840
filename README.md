@@ -18,4 +18,4 @@ Test 50 times and use 8 workers:
 
 ### Ref
 
-https://github.com/markity/6.5840
+https://zhuanlan.zhihu.com/p/672530996?
