@@ -111,7 +111,7 @@ func (rf *Raft) Debug(format string, args ...interface{}) {
 }
 
 func (rf *Raft) RandElectionTimer() {
-	t := time.Millisecond*150 + time.Millisecond*time.Duration((rand.Int()%150))
+	t := time.Millisecond*250 + time.Millisecond*time.Duration((rand.Int()%150))
 	rf.Debug("set rand election timer: %v", t)
 	rf.timer = time.After(t)
 }
@@ -540,6 +540,7 @@ func StateMachine(rf *Raft) {
 
 			switch val := input.Msg.(type) {
 			case *RequestVoteReply:
+				rf.Debug("it is RequestVoteReply")
 				// 如果是>当前term, 那么马上转变成follower, 更新term
 				/*原文, 就算是VoteReply, 如果发现自己的term落后了, 也需要立马回到follower, 更新term
 				All Servers
@@ -630,7 +631,7 @@ func StateMachine(rf *Raft) {
 							lastLog := rf.state.Logs.LastLog()
 							if val.LastLogTerm < lastLog.LogTerm || (val.LastLogTerm == lastLog.LogTerm &&
 								val.LastLogIndex < lastLog.LogIndex) {
-								rf.Debug("disgranted %v to be leader beacuuse remote lastlog(term=%v index=%v) is newer than my last log(term=%v index=%v)",
+								rf.Debug("disgranted %v to be leader beacuuse remote lastlog(term=%v index=%v) is older than my last log(term=%v index=%v)",
 									val.CandidateID, val.LastLogTerm, val.LastLogIndex, lastLog.LogTerm, lastLog.LogIndex)
 								go func(t int) {
 									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
@@ -640,7 +641,7 @@ func StateMachine(rf *Raft) {
 									})
 								}(rf.state.Term)
 							} else {
-								rf.Debug("granted %v to be leader, self logs=%v", rf.state.CandidateState, rf.state.Logs)
+								rf.Debug("granted %v to be leader, self logs=%v", val.CandidateID, rf.state.Logs)
 								rf.state.PersistInfo.VotedForThisTerm = val.CandidateID
 								rf.persist()
 								go func(t int) {
@@ -802,6 +803,7 @@ func StateMachine(rf *Raft) {
 					})
 				}(rf.state.Term)
 			case *AppendEntriesReply:
+				rf.Debug("it is AppendEntriesReply")
 				// 此时自己的term>=对方的term
 				// 只有leader理这个信息
 				if rf.state.State != "leader" {
