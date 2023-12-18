@@ -57,6 +57,13 @@ func (l *Logs) GetByIndex(idx int) LogEntry {
 	return (*l)[idx-(*l)[0].LogIndex]
 }
 
+// 剪切日志, 但是包含那个日志, 把idx对应日志的command变为空
+func (l *Logs) TrimLogs(idx int) {
+	i := l.GetByIndex(idx).LogIndex - (*l)[0].LogIndex
+	(*l) = (*l)[i:]
+	(*l)[0].Command = nil
+}
+
 // 截断后面的指定id以及后面的所有日志
 func (l *Logs) TruncateBy(id int) {
 	*l = (*l)[:id-(*l)[0].LogIndex]

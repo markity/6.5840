@@ -438,7 +438,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 				msg := v.(ApplyMsg)
 				if msg.SnapshotValid {
-					log.Printf("applyCh got snapshot: %s\n", string(msg.Snapshot))
+					if Debug {
+						log.Printf("applyCh got snapshot: %s\n", string(msg.Snapshot))
+					}
 				}
 				applyCh <- msg
 			}
@@ -479,22 +481,14 @@ func StateMachine(rf *Raft) {
 		})
 	}
 
-	// 0 1 2 3 4 5
-	// index = 4
 	for {
 		select {
 		case info := <-rf.snapshotChan:
 			rf.Debug("got snapshot command, logs=%v", rf.state.Logs)
 
-			// 3 4 5
-			i := info.Index - rf.state.Logs[0].LogIndex
-			l, ok := rf.state.Logs.FindLogByIndex(info.Index)
-			if !ok {
-				panic("checkme")
-			}
-			rf.state.Logs = rf.state.Logs[i:]
-			// the first entry in log is just for preLog
-			rf.state.Logs[0].Command = nil
+			// 收到裁减log的命令, 需要进行日志裁减, 然后把新的snapshot持久化
+			l := rf.state.Logs.GetByIndex(info.Index)
+			rf.state.Logs.TrimLogs(info.Index)
 			rf.state.LastIncludedIndex = l.LogIndex
 			rf.state.LastIncludedTerm = l.LogTerm
 			rf.persist(info.SnapShot)
@@ -541,14 +535,14 @@ func StateMachine(rf *Raft) {
 				lastLog := rf.state.Logs.LastLog()
 				for i := range rf.peers {
 					if i != rf.me {
-						go func(i int, t int) {
+						go func(i int, t int, lastLog LogEntry) {
 							rf.sendRequestVoteRequest(i, &RequestVoteRequest{
 								Term:         t,
 								CandidateID:  rf.me,
 								LastLogTerm:  lastLog.LogTerm,
 								LastLogIndex: lastLog.LogIndex,
 							})
-						}(i, rf.state.Term)
+						}(i, rf.state.Term, lastLog)
 					}
 				}
 			// 说明candidate超时了, 加term继续
@@ -564,15 +558,14 @@ func StateMachine(rf *Raft) {
 				// 外部会共享这个变量, 为了并发安全我们需要拷贝一份t给协程用
 				for i := range rf.peers {
 					if i != rf.me {
-						lastLog := rf.state.Logs.LastLog()
-						go func(i int, t int) {
+						go func(i int, t int, lastLog LogEntry) {
 							rf.sendRequestVoteRequest(i, &RequestVoteRequest{
 								Term:         t,
 								CandidateID:  rf.me,
 								LastLogTerm:  lastLog.LogTerm,
 								LastLogIndex: lastLog.LogIndex,
 							})
-						}(i, rf.state.Term)
+						}(i, rf.state.Term, rf.state.Logs.LastLog())
 					}
 				}
 
@@ -678,7 +671,6 @@ func StateMachine(rf *Raft) {
 				}
 
 				if rf.state.State == "candidate" {
-
 					rf.state.State = "follower"
 					rf.state.PersistInfo.Term = input.Term
 					rf.state.PersistInfo.VotedForThisTerm = rf.me
@@ -696,13 +688,15 @@ func StateMachine(rf *Raft) {
 				if (ok && hasEntry.LogTerm == val.Term) ||
 					rf.state.CommitIndex >= val.LastIncludedIndex {
 					rf.Debug("already has the entry, ignoring")
-					rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
-						ReqTerm:              val.Term,
-						ReqLastIncludedIndex: val.LastIncludedIndex,
-						ReqLastIncludedTerm:  val.LastIncludedTerm,
-						ID:                   rf.me,
-						Term:                 rf.state.Term,
-					})
+					go func(t int) {
+						rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+							ReqTerm:              val.Term,
+							ReqLastIncludedIndex: val.LastIncludedIndex,
+							ReqLastIncludedTerm:  val.LastIncludedTerm,
+							ID:                   rf.me,
+							Term:                 t,
+						})
+					}(rf.state.Term)
 					break
 				}
 
@@ -727,15 +721,15 @@ func StateMachine(rf *Raft) {
 					SnapshotTerm:  val.LastIncludedTerm,
 					SnapshotIndex: val.LastIncludedIndex,
 				})
-				go func() {
+				go func(t int) {
 					rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
 						ReqTerm:              val.Term,
 						ReqLastIncludedIndex: val.LastIncludedIndex,
 						ReqLastIncludedTerm:  val.LastIncludedTerm,
 						ID:                   rf.me,
-						Term:                 rf.state.Term,
+						Term:                 t,
 					})
-				}()
+				}(rf.state.Term)
 			case *InstallSnapshotReply:
 				rf.Debug("it is InstallSnapshotReply from %v", val.ID)
 

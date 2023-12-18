@@ -5,7 +5,7 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
 
 type unboundedQueue struct {
 	m sync.Mutex
