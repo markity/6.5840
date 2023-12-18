@@ -17,6 +17,13 @@ type GetStateInfo struct {
 	Isleader bool
 }
 
+type DoSnapshotInfo struct {
+	Index    int
+	SnapShot []byte
+
+	SnapshotOKChan chan struct{}
+}
+
 type Message struct {
 	Term int
 	Msg  interface{}
@@ -36,7 +43,6 @@ type SendCmdRespInfo struct {
 type RaftState struct {
 	State       string
 	CommitIndex int
-	LastApplied int
 
 	FollowerState
 	CandidateState
@@ -63,7 +69,9 @@ type LeaderState struct {
 }
 
 type PersistInfo struct {
-	Term             int
-	Logs             Logs
-	VotedForThisTerm int
+	Term              int
+	Logs              Logs
+	VotedForThisTerm  int
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }

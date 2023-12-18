@@ -39,6 +39,8 @@ type Raft struct {
 	// 外部消息, 进入总线
 	messagePipeLine chan Message
 
+	snapshotChan chan DoSnapshotInfo
+
 	// apply相关的设施
 	applyCh    chan ApplyMsg
 	applyQueue *unboundedQueue
@@ -66,7 +68,7 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
+func (rf *Raft) persist(snapShot []byte) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	err := e.Encode(&rf.state.PersistInfo)
@@ -74,7 +76,10 @@ func (rf *Raft) persist() {
 		panic(err)
 	}
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	if snapShot == nil {
+		snapShot = rf.persister.ReadSnapshot()
+	}
+	rf.persister.Save(raftstate, snapShot)
 }
 
 // restore previously persisted state.
@@ -98,8 +103,14 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	ok := make(chan struct{})
+	rf.snapshotChan <- DoSnapshotInfo{
+		Index:          index,
+		SnapShot:       snapshot,
+		SnapshotOKChan: ok,
+	}
 
+	<-ok
 }
 
 func (rf *Raft) Debug(format string, args ...interface{}) {
@@ -111,13 +122,15 @@ func (rf *Raft) Debug(format string, args ...interface{}) {
 }
 
 func (rf *Raft) RandElectionTimer() {
-	t := time.Millisecond*250 + time.Millisecond*time.Duration((rand.Int()%150))
+	t := time.Millisecond*LEADER_ELECTION_TIMEOUT_LOW +
+		time.Millisecond*time.Duration(
+			(rand.Int()%(LEADER_ELECTION_TIMEOUT_HIGH-LEADER_ELECTION_TIMEOUT_LOW)))
 	rf.Debug("set rand election timer: %v", t)
 	rf.timer = time.After(t)
 }
 
 func (rf *Raft) ResetLeaderTimer() {
-	rf.timer = time.After(time.Millisecond * 100)
+	rf.timer = time.After(time.Millisecond * HEARTBEAT_INTERVAL)
 	rf.Debug("reset leader timer")
 }
 
@@ -164,6 +177,22 @@ type AppendEntriesReply struct {
 	ConflictIndex int
 }
 
+type InstallSnapshotRequest struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Snapshot          []byte
+}
+
+type InstallSnapshotReply struct {
+	ReqTerm              int
+	ReqLastIncludedIndex int
+	ReqLastIncludedTerm  int
+	ID                   int
+	Term                 int
+}
+
 // 外部调用, 会进入这里来
 func (rf *Raft) RequestVoteReq(args *RequestVoteRequest, reply *Empty) {
 	rf.messagePipeLine <- Message{
@@ -193,15 +222,34 @@ func (rf *Raft) AppendEntriesReply(args *AppendEntriesReply, reply *Empty) {
 	}
 }
 
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *Empty) {
+	rf.messagePipeLine <- Message{
+		Term: args.Term,
+		Msg:  args,
+	}
+}
+
+func (rf *Raft) InstallSnapshotReply(args *InstallSnapshotReply, reply *Empty) {
+	rf.messagePipeLine <- Message{
+		Term: args.Term,
+		Msg:  args,
+	}
+}
+
 func (rf *Raft) Commit(leaderCommitIndex int, newEntry LogEntry) {
 	if leaderCommitIndex > rf.state.CommitIndex {
 		oldCommitIndex := rf.state.CommitIndex
 		rf.state.CommitIndex = min(leaderCommitIndex, newEntry.LogIndex)
 
 		for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
+			l, ok := rf.state.Logs.FindLogByIndex(i)
+			if !ok {
+				log.Panicf("oldCommitIndex=%v newCommitIndex=%v i = %v logs=%v", oldCommitIndex, rf.state.CommitIndex, i, rf.state.Logs)
+				panic("checkme")
+			}
 			msg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.state.PersistInfo.Logs.At(i).Command,
+				Command:      l.Command,
 				CommandIndex: i,
 			}
 			rf.Debug("applied log %v", msg)
@@ -215,51 +263,74 @@ func (rf *Raft) LeaderSendLogs(to int) {
 		panic("checkme")
 	}
 
-	logsCopy_ := rf.state.Logs.Copy()
-	nextIndexCopy_ := make([]int, len(rf.state.NextLogIndex))
-	copy(nextIndexCopy_, rf.state.NextLogIndex)
+	if rf.state.NextLogIndex[to] <= rf.state.LastIncludedIndex {
+		s := rf.persister.ReadSnapshot()
+		rf.Debug("leader send snapshot to %v, len(snapshot)=%v", to, len(s))
+		go func(to int, term int, snapshot []byte, lastIncIndex int, lastIncTerm int) {
+			rf.sendInstallSnapshotRequest(to, &InstallSnapshotRequest{
+				Term:              term,
+				LeaderID:          rf.me,
+				LastIncludedIndex: lastIncIndex,
+				LastIncludedTerm:  lastIncTerm,
+				Snapshot:          snapshot,
+			})
+		}(to, rf.state.Term, s, rf.state.PersistInfo.LastIncludedIndex,
+			rf.state.PersistInfo.LastIncludedTerm)
+	} else {
+		logsCopy_ := rf.state.Logs.Copy()
+		nextIndexCopy_ := make([]int, len(rf.state.NextLogIndex))
+		copy(nextIndexCopy_, rf.state.NextLogIndex)
 
-	go func(i int, logs Logs, nextIndex []int, commitIndex int, term int) {
-		/*
-			If last log index ≥ nextIndex for a follower: send
-			AppendEntries RPC with log entries starting at nextIndex
-		*/
-		lastLog := logs.LastLog()
-		preLog := logs.At(nextIndex[i] - 1)
-		if lastLog.LogIndex >= nextIndex[i] {
-			forPrint := make([]LogEntry, 0)
-			tobeSendLogs := make([][]byte, 0)
-			for i := nextIndex[i]; i <= lastLog.LogIndex; i++ {
-				tobeSendLogs = append(tobeSendLogs, logs[i].ToBytes())
-				forPrint = append(forPrint, logs[i])
+		go func(i int, logs Logs, nextIndex []int, commitIndex int, term int) {
+			/*
+				If last log index ≥ nextIndex for a follower: send
+				AppendEntries RPC with log entries starting at nextIndex
+			*/
+			lastLog := logs.LastLog()
+			preLog, ok := logs.FindLogByIndex(nextIndex[i] - 1)
+			if !ok {
+				fmt.Println(logs, nextIndex)
+				panic("checkme")
 			}
-			if Debug {
-				log.Printf("%v send log(%v) to %v, prelog(index=%v term=%v)",
-					rf.me, forPrint, i, preLog.LogIndex, preLog.LogTerm)
+			if lastLog.LogIndex >= nextIndex[i] {
+				forPrint := make([]LogEntry, 0)
+				tobeSendLogs := make([][]byte, 0)
+				for i := nextIndex[i]; i <= lastLog.LogIndex; i++ {
+					l, ok := logs.FindLogByIndex(i)
+					if !ok {
+						panic("checkme")
+					}
+					tobeSendLogs = append(tobeSendLogs, l.ToBytes())
+					forPrint = append(forPrint, l)
+				}
+				if Debug {
+					log.Printf("%v send log(%v) to %v, prelog(index=%v term=%v)",
+						rf.me, forPrint, i, preLog.LogIndex, preLog.LogTerm)
+				}
+				rf.sendAppendEntriesRequest(i, &AppendEntriesRequest{
+					Term:         term,
+					LeaderID:     rf.me,
+					PrevLogIndex: preLog.LogIndex,
+					PreLogTerm:   preLog.LogTerm,
+					Entries:      tobeSendLogs,
+					LeaderCommit: commitIndex,
+				})
+			} else {
+				if Debug {
+					log.Printf("%v send heartbeat to %v, prelog(index=%v term=%v)",
+						rf.me, i, preLog.LogIndex, preLog.LogTerm)
+				}
+				rf.sendAppendEntriesRequest(i, &AppendEntriesRequest{
+					Term:         term,
+					LeaderID:     rf.me,
+					PrevLogIndex: lastLog.LogIndex,
+					PreLogTerm:   lastLog.LogTerm,
+					Entries:      nil,
+					LeaderCommit: commitIndex,
+				})
 			}
-			rf.sendAppendEntriesRequest(i, &AppendEntriesRequest{
-				Term:         term,
-				LeaderID:     rf.me,
-				PrevLogIndex: preLog.LogIndex,
-				PreLogTerm:   preLog.LogTerm,
-				Entries:      tobeSendLogs,
-				LeaderCommit: commitIndex,
-			})
-		} else {
-			if Debug {
-				log.Printf("%v send heartbeat to %v, prelog(index=%v term=%v)",
-					rf.me, i, preLog.LogIndex, preLog.LogTerm)
-			}
-			rf.sendAppendEntriesRequest(i, &AppendEntriesRequest{
-				Term:         term,
-				LeaderID:     rf.me,
-				PrevLogIndex: lastLog.LogIndex,
-				PreLogTerm:   lastLog.LogTerm,
-				Entries:      nil,
-				LeaderCommit: commitIndex,
-			})
-		}
-	}(to, logsCopy_, nextIndexCopy_, rf.state.CommitIndex, rf.state.Term)
+		}(to, logsCopy_, nextIndexCopy_, rf.state.CommitIndex, rf.state.Term)
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -305,6 +376,14 @@ func (rf *Raft) sendAppendEntriesReply(server int, args *AppendEntriesReply) {
 	rf.peers[server].Call("Raft.AppendEntriesReply", args, &Empty{})
 }
 
+func (rf *Raft) sendInstallSnapshotRequest(server int, args *InstallSnapshotRequest) {
+	rf.peers[server].Call("Raft.InstallSnapshot", args, &Empty{})
+}
+
+func (rf *Raft) sendInstallSnapshotReply(server int, args *InstallSnapshotReply) {
+	rf.peers[server].Call("Raft.InstallSnapshotReply", args, &Empty{})
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -348,6 +427,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.applyQueue = NewUnboundedQueue()
 	rf.reqDeadOK = make(chan struct{})
+	rf.snapshotChan = make(chan DoSnapshotInfo)
 
 	go func() {
 		for {
@@ -356,7 +436,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				if Debug {
 					log.Printf("[async thread] %v send to applyCh %v\n", rf.me, v)
 				}
-				rf.applyCh <- v.(ApplyMsg)
+				msg := v.(ApplyMsg)
+				if msg.SnapshotValid {
+					log.Printf("applyCh got snapshot: %s\n", string(msg.Snapshot))
+				}
+				applyCh <- msg
 			}
 		}
 	}()
@@ -383,9 +467,41 @@ func StateMachine(rf *Raft) {
 	}
 	rf.Debug("be follower")
 	rf.RandElectionTimer()
+	snapShot := rf.persister.ReadSnapshot()
+	if len(snapShot) != 0 {
+		rf.Debug("have initization snapshot, length=%v", len(snapShot))
+		rf.state.CommitIndex = rf.state.LastIncludedIndex
+		rf.applyQueue.Push(ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      rf.persister.ReadSnapshot(),
+			SnapshotTerm:  rf.state.LastIncludedTerm,
+			SnapshotIndex: rf.state.LastIncludedIndex,
+		})
+	}
 
+	// 0 1 2 3 4 5
+	// index = 4
 	for {
 		select {
+		case info := <-rf.snapshotChan:
+			rf.Debug("got snapshot command, logs=%v", rf.state.Logs)
+
+			// 3 4 5
+			i := info.Index - rf.state.Logs[0].LogIndex
+			l, ok := rf.state.Logs.FindLogByIndex(info.Index)
+			if !ok {
+				panic("checkme")
+			}
+			rf.state.Logs = rf.state.Logs[i:]
+			// the first entry in log is just for preLog
+			rf.state.Logs[0].Command = nil
+			rf.state.LastIncludedIndex = l.LogIndex
+			rf.state.LastIncludedTerm = l.LogTerm
+			rf.persist(info.SnapShot)
+			rf.Debug("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
+				info.Index, rf.state.Logs, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm)
+
+			info.SnapshotOKChan <- struct{}{}
 		case <-rf.reqDead:
 			rf.Debug("dead")
 			rf.reqDeadOK <- struct{}{}
@@ -415,7 +531,7 @@ func StateMachine(rf *Raft) {
 				rf.state.ReceivedNAgrees = 1
 				rf.state.PersistInfo.VotedForThisTerm = rf.me
 				rf.state.PersistInfo.Term++
-				rf.persist()
+				rf.persist(nil)
 
 				rf.RandElectionTimer()
 				rf.Debug("just timeout, being candidate, logs = %v", rf.state.Logs)
@@ -440,7 +556,7 @@ func StateMachine(rf *Raft) {
 				rf.state.State = "candidate"
 				rf.state.ReceivedNAgrees = 1
 				rf.state.PersistInfo.Term++
-				rf.persist()
+				rf.persist(nil)
 				rf.RandElectionTimer()
 
 				rf.Debug("candidate timeout, retrying")
@@ -462,7 +578,8 @@ func StateMachine(rf *Raft) {
 
 			// leader超时是定时器超时, 只需要发送心跳维统治即可
 			case "leader":
-				rf.Debug("timeout, logs=%v, nextIndex=%v, matchIndex=%v", rf.state.Logs, rf.state.NextLogIndex, rf.state.MatchIndex)
+				rf.Debug("timeout, logs=%v, nextIndex=%v, matchIndex=%v, lastIncIndex=%v, lastIncTerm=%v, commitIndex=%v", rf.state.Logs,
+					rf.state.NextLogIndex, rf.state.MatchIndex, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm, rf.state.CommitIndex)
 				for i := range rf.peers {
 					if i != rf.me {
 						rf.LeaderSendLogs(i)
@@ -489,7 +606,7 @@ func StateMachine(rf *Raft) {
 					LogIndex: len(rf.state.PersistInfo.Logs),
 					Command:  command.Command,
 				})
-				rf.persist()
+				rf.persist(nil)
 				l := rf.state.Logs.LastLog().LogIndex
 				rf.Debug("received command(%v), index would be %v, now logs is %v", command.Command, l, rf.state.Logs)
 				go func(t int, l int) {
@@ -521,7 +638,7 @@ func StateMachine(rf *Raft) {
 				rf.state.State = "follower"
 				rf.state.PersistInfo.Term = input.Term
 				rf.state.PersistInfo.VotedForThisTerm = -1
-				rf.persist()
+				rf.persist(nil)
 
 				/*
 					If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)这个是不需要reset election timeout的
@@ -539,6 +656,141 @@ func StateMachine(rf *Raft) {
 			}
 
 			switch val := input.Msg.(type) {
+			case *InstallSnapshotRequest:
+				rf.Debug("got InstallSnapshotRequest, lastIncIdx=%v, lastIncTerm=%v, self logs=%v",
+					val.LastIncludedIndex, val.LastIncludedTerm, rf.state.Logs)
+				// 自己的term >= 对方了, 如果对面的term比自己小, 那么直接发信息让对方回到follower
+				if val.Term < rf.state.Term {
+					rf.Debug("but self term(%v) > remote term(%v), sending to make it follower",
+						rf.state.Term, val.Term)
+					go func(t int) {
+						rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+							ReqTerm: val.Term,
+							Term:    t,
+						})
+					}(rf.state.Term)
+					break
+				}
+
+				// 当前term相等, 是不可能产生两个leader的
+				if rf.state.State == "leader" {
+					panic("checkme")
+				}
+
+				if rf.state.State == "candidate" {
+
+					rf.state.State = "follower"
+					rf.state.PersistInfo.Term = input.Term
+					rf.state.PersistInfo.VotedForThisTerm = rf.me
+					rf.Debug("got installSnapshotRequest from %v, candidate to follower(same term)", val.LeaderID)
+					rf.persist(nil)
+				}
+
+				rf.RandElectionTimer()
+
+				/*
+					If existing log entry has same index and term as snapshot’s
+					last included entry, retain log entries following it and reply
+				*/
+				hasEntry, ok := rf.state.Logs.FindLogByIndex(val.LastIncludedIndex)
+				if (ok && hasEntry.LogTerm == val.Term) ||
+					rf.state.CommitIndex >= val.LastIncludedIndex {
+					rf.Debug("already has the entry, ignoring")
+					rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+						ReqTerm:              val.Term,
+						ReqLastIncludedIndex: val.LastIncludedIndex,
+						ReqLastIncludedTerm:  val.LastIncludedTerm,
+						ID:                   rf.me,
+						Term:                 rf.state.Term,
+					})
+					break
+				}
+
+				rf.Debug("not have the entry, discarding all and putting it in applyCh, len(snapshot)=%v", len(val.Snapshot))
+				// discard all logs
+				var newLogs Logs
+				newLogs = append(newLogs, LogEntry{
+					LogTerm:  val.LastIncludedTerm,
+					LogIndex: val.LastIncludedIndex,
+					// it is for preLog, Command is useless
+					Command: nil,
+				})
+				rf.state.Logs = newLogs
+				rf.state.LastIncludedIndex = val.LastIncludedIndex
+				rf.state.LastIncludedTerm = val.LastIncludedTerm
+				rf.state.CommitIndex = val.LastIncludedIndex
+				rf.persist(val.Snapshot)
+				rf.applyQueue.Push(ApplyMsg{
+					CommandValid:  false,
+					SnapshotValid: true,
+					Snapshot:      val.Snapshot,
+					SnapshotTerm:  val.LastIncludedTerm,
+					SnapshotIndex: val.LastIncludedIndex,
+				})
+				go func() {
+					rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+						ReqTerm:              val.Term,
+						ReqLastIncludedIndex: val.LastIncludedIndex,
+						ReqLastIncludedTerm:  val.LastIncludedTerm,
+						ID:                   rf.me,
+						Term:                 rf.state.Term,
+					})
+				}()
+			case *InstallSnapshotReply:
+				rf.Debug("it is InstallSnapshotReply from %v", val.ID)
+
+				if rf.state.State != "leader" {
+					break
+				}
+
+				// 滞后的消息, 忽略
+				if val.ReqTerm != rf.state.Term {
+					break
+				}
+
+				// 来的消息是其它朝代的, 也许是自己之前当过leader, 然后reply滞后了
+				//		这种情况不用管, 之后的心跳会同步它的
+				if val.Term < rf.state.Term {
+					break
+				}
+
+				nextLogMaybeSet := val.ReqLastIncludedIndex + 1
+				rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
+				rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
+				rf.Debug("set server nextLogIndex=%v", rf.state.NextLogIndex[val.ID])
+
+				if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
+					rf.Debug("still have logs tobe send, sending selflogs=%v, nextindex=%v", rf.state.Logs, rf.state.NextLogIndex)
+					rf.LeaderSendLogs(val.ID)
+				}
+
+				sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
+				copy(sortedMatchIndex, rf.state.MatchIndex)
+				sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
+				sort.Ints(sortedMatchIndex)
+				N := sortedMatchIndex[len(rf.peers)/2]
+				if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs.
+					GetByIndex(N).LogTerm == rf.state.PersistInfo.Term {
+
+					oldCommitIndex := rf.state.CommitIndex
+					rf.state.CommitIndex = N
+					flag := false
+					rf.Debug("commit log, matchIdx=%v N=%v oldCommitIndex=%v, now is %v",
+						rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
+					for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
+						flag = true
+						msg := ApplyMsg{
+							CommandValid: true,
+							Command:      rf.state.PersistInfo.Logs[i].Command,
+							CommandIndex: i,
+						}
+						rf.Debug("applied log: %v", msg)
+						rf.applyQueue.Push(msg)
+					}
+					if !flag {
+						panic("checkme")
+					}
+				}
 			case *RequestVoteReply:
 				rf.Debug("it is RequestVoteReply")
 				// 如果是>当前term, 那么马上转变成follower, 更新term
@@ -577,7 +829,7 @@ func StateMachine(rf *Raft) {
 							to send to that server (initialized to leader
 							last log index + 1)
 						*/
-						nextIndex := rf.state.Logs.LastEntryIndex() + 1
+						nextIndex := rf.state.Logs.LastLogIndex() + 1
 						for i := 0; i < len(rf.peers); i++ {
 							rf.state.NextLogIndex[i] = nextIndex
 							rf.state.MatchIndex[i] = 0
@@ -643,7 +895,7 @@ func StateMachine(rf *Raft) {
 							} else {
 								rf.Debug("granted %v to be leader, self logs=%v", val.CandidateID, rf.state.Logs)
 								rf.state.PersistInfo.VotedForThisTerm = val.CandidateID
-								rf.persist()
+								rf.persist(nil)
 								go func(t int) {
 									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
 										Term:        t,
@@ -720,15 +972,18 @@ func StateMachine(rf *Raft) {
 					rf.state.PersistInfo.Term = input.Term
 					rf.state.PersistInfo.VotedForThisTerm = rf.me
 					rf.Debug("got ae from %v, candidate to follower(same term)", val.LeaderID)
-					rf.persist()
+					rf.persist(nil)
 				}
 
 				// 重置timer
 				rf.RandElectionTimer()
 
 				// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
-				if _, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex); !ok {
-					rf.Debug("no preLog in logs, refusing")
+				rf.Debug("preLogIndex=%v", val.PrevLogIndex)
+				preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
+				if !ok {
+					rf.Debug("no preLog in logs, refusing, preLogIndex=%v preLogTerm=%v", val.PrevLogIndex,
+						val.PreLogTerm)
 					go func(t int) {
 						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
 							ID:             rf.me,
@@ -745,17 +1000,18 @@ func StateMachine(rf *Raft) {
 
 				// 如果已经拥有preLog, 那么需要检查是否应该丢弃log
 				// preLog匹配不上, 要求leader回溯
-				if rf.state.PersistInfo.Logs[val.PrevLogIndex].LogTerm != val.PreLogTerm {
-					conflictTerm := rf.state.Logs[val.PrevLogIndex].LogTerm
-					i := val.PrevLogIndex
+				if preLog.LogTerm != val.PreLogTerm {
+					conflictTerm := rf.state.Logs.GetByIndex(val.PrevLogIndex).LogTerm
+					i := val.PrevLogIndex - rf.state.Logs[0].LogIndex
 					for ; i > 0; i-- {
 						if rf.state.Logs[i].LogTerm != conflictTerm {
 							break
 						}
 					}
+					rf.Debug("prelog conflict, self logs = %v", rf.state.Logs)
 					rf.state.Logs.TruncateBy(val.PrevLogIndex)
 					rf.Debug("prelog conflict, now logs = %v", rf.state.Logs)
-					rf.persist()
+					rf.persist(nil)
 					go func(t int) {
 						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
 							ID:             rf.me,
@@ -772,7 +1028,6 @@ func StateMachine(rf *Raft) {
 
 				rf.Debug("prelog is matched")
 				// preLog能匹配了, 如果Entries没有, 那么必然成功, 此时同步preLog那里
-				preLog := rf.state.PersistInfo.Logs.At(val.PrevLogIndex)
 				if len(entries) == 0 {
 					rf.Commit(val.LeaderCommit, preLog)
 				} else {
@@ -788,7 +1043,7 @@ func StateMachine(rf *Raft) {
 							rf.state.Logs.Append(entry)
 						}
 					}
-					rf.persist()
+					rf.persist(nil)
 					rf.Commit(val.LeaderCommit, entries[len(entries)-1])
 				}
 
@@ -820,19 +1075,31 @@ func StateMachine(rf *Raft) {
 					break
 				}
 
-				// 过滤过时的ack
-				if val.PreIndex != rf.state.Logs.At(rf.state.NextLogIndex[val.ID]-1).LogIndex {
+				// 如果已经在当前日志找不到前一个日志了, 就应当发送installSnapshot了, 我觉得下一次心跳发比较合适, 因为这可能是过时的信息
+				preEntry, ok := rf.state.Logs.FindLogByIndex(rf.state.NextLogIndex[val.ID] - 1)
+				if !ok {
+					rf.Debug("cannot find preLog, waiting heartbeat send snapshot")
+					break
+				}
+
+				// 如果找到了前一个日志, 但是index不相等, 说明过时了, 直接忽略就行了
+				if val.PreIndex != preEntry.LogIndex {
 					break
 				}
 
 				if !val.Success {
 					if val.ConflictIndex == -1 {
-						j := val.PreIndex
-						for j >= 0 && rf.state.Logs[j].LogTerm == rf.state.Logs.At(val.PreIndex).LogTerm {
+						l, ok := rf.state.Logs.FindLogByIndex(val.PreIndex)
+						if !ok {
+							panic("checkme")
+						}
+						// 5 6 7 8
+						j := l.LogIndex - rf.state.Logs[0].LogIndex
+						for j >= 0 && rf.state.Logs.At(j).LogTerm == l.LogTerm {
 							j--
 						}
-						rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], j+1)
 						rf.Debug("case2, j+1=%v", j+1)
+						rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], rf.state.Logs.At(j+1).LogIndex)
 					} else {
 						rf.state.NextLogIndex[val.ID] = min(val.ConflictIndex, rf.state.NextLogIndex[val.ID])
 						rf.Debug("case2, ConflictIndex=%v", val.ConflictIndex)
@@ -857,13 +1124,15 @@ func StateMachine(rf *Raft) {
 					// If there exists an N such that N > commitIndex,
 					//  a majority of matchIndex[i] ≥ N, and log[N].
 					// term == currentTerm: set commitIndex = N
-					// TODO: 现在需要判断某个index的日志是否可以提交了, 更新commitIndex
 					sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
 					copy(sortedMatchIndex, rf.state.MatchIndex)
-					sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
+					sortedMatchIndex[rf.me] = rf.state.Logs.LastLogIndex()
 					sort.Ints(sortedMatchIndex)
 					N := sortedMatchIndex[len(rf.peers)/2]
-					if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs[N].LogTerm == rf.state.PersistInfo.Term {
+					rf.Debug("leader checking can commit %v, N = %v", sortedMatchIndex, N)
+					if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs.
+						GetByIndex(N).LogTerm == rf.state.PersistInfo.Term {
+
 						oldCommitIndex := rf.state.CommitIndex
 						rf.state.CommitIndex = N
 						flag := false
@@ -871,9 +1140,13 @@ func StateMachine(rf *Raft) {
 							rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
 						for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
 							flag = true
+							l, ok := rf.state.Logs.FindLogByIndex(i)
+							if !ok {
+								panic("checkme")
+							}
 							msg := ApplyMsg{
 								CommandValid: true,
-								Command:      rf.state.PersistInfo.Logs[i].Command,
+								Command:      l.Command,
 								CommandIndex: i,
 							}
 							rf.Debug("applied log: %v", msg)

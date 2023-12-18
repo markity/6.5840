@@ -33,35 +33,42 @@ func (l *Logs) LastLog() LogEntry {
 	return (*l)[len(*l)-1]
 }
 
-// 0 1 2 3
-func (l *Logs) FindLogByIndex(id int) (LogEntry, bool) {
-	if len(*l)-1 < id {
+// 0 1 2 3 4 5
+// 1 2 3 4 5 6
+func (l *Logs) FindLogByIndex(idx int) (LogEntry, bool) {
+	realIdx := idx - (*l)[0].LogIndex
+	if realIdx < 0 || len(*l)-1 < realIdx {
 		return LogEntry{}, false
 	}
-	return (*l)[id], true
+	return (*l)[realIdx], true
 }
 
 func (l *Logs) At(id int) LogEntry {
 	return (*l)[id]
 }
 
-func (l *Logs) LastEntryIndex() int {
-	return len(*l) - 1
+// 如果日志为空, 返回lastIncludedIndex
+func (l *Logs) LastLogIndex() int {
+	return (*l)[len(*l)-1].LogIndex
 }
 
-// 阶段后面的指定id以及后面的所有日志
+// 4 5 6 7 8
+func (l *Logs) GetByIndex(idx int) LogEntry {
+	return (*l)[idx-(*l)[0].LogIndex]
+}
+
+// 截断后面的指定id以及后面的所有日志
 func (l *Logs) TruncateBy(id int) {
-	*l = (*l)[:id]
+	*l = (*l)[:id-(*l)[0].LogIndex]
 }
 
 func (l *Logs) Append(e LogEntry) {
+	e.LogIndex = l.LastLog().LogIndex + 1
 	*l = append(*l, e)
 }
 
 func (l *Logs) Copy() Logs {
 	lo := Logs{}
-	for _, v := range *l {
-		lo.Append(v)
-	}
+	lo = append(lo, *l...)
 	return lo
 }
