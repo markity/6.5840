@@ -487,7 +487,12 @@ func StateMachine(rf *Raft) {
 			rf.Debug("got snapshot command, logs=%v", rf.state.Logs)
 
 			// 收到裁减log的命令, 需要进行日志裁减, 然后把新的snapshot持久化
-			l := rf.state.Logs.GetByIndex(info.Index)
+			l, ok := rf.state.Logs.FindLogByIndex(info.Index)
+			if !ok {
+				rf.Debug("got snapshot command, but not found log in logs")
+				info.SnapshotOKChan <- struct{}{}
+				break
+			}
 			rf.state.Logs.TrimLogs(info.Index)
 			rf.state.LastIncludedIndex = l.LogIndex
 			rf.state.LastIncludedTerm = l.LogTerm
