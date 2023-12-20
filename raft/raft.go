@@ -483,44 +483,6 @@ func StateMachine(rf *Raft) {
 
 	for {
 		select {
-		case info := <-rf.snapshotChan:
-			rf.Debug("got snapshot command, logs=%v", rf.state.Logs)
-
-			// 收到裁减log的命令, 需要进行日志裁减, 然后把新的snapshot持久化
-			l, ok := rf.state.Logs.FindLogByIndex(info.Index)
-			if !ok {
-				rf.Debug("got snapshot command, but not found log in logs")
-				info.SnapshotOKChan <- struct{}{}
-				break
-			}
-			rf.state.Logs.TrimLogs(info.Index)
-			rf.state.LastIncludedIndex = l.LogIndex
-			rf.state.LastIncludedTerm = l.LogTerm
-			rf.persist(info.SnapShot)
-			rf.Debug("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
-				info.Index, rf.state.Logs, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm)
-
-			info.SnapshotOKChan <- struct{}{}
-		case <-rf.reqDead:
-			rf.Debug("dead")
-			rf.reqDeadOK <- struct{}{}
-			// 测试用例会在raft dead后发start, 需要避免问题我采取了个折中的方案
-			go func() {
-				for {
-					c := <-rf.sendCmdChan
-					c.Resp <- SendCmdRespInfo{Term: -1, Index: -1, IsLeader: false}
-				}
-			}()
-			return
-		case <-rf.reqGetState:
-			rf.Debug("rf.reqGetState")
-			go func(t int, isLeader bool) {
-				rf.getStateChan <- GetStateInfo{
-					Term:     t,
-					Isleader: isLeader,
-				}
-			}(rf.state.Term, rf.state.State == "leader")
-		// 选举超时timer
 		case <-rf.timer:
 			rf.Debug("timeout")
 			switch rf.state.State {
@@ -585,114 +547,251 @@ func StateMachine(rf *Raft) {
 				}
 				rf.ResetLeaderTimer()
 			}
-		// 统一的外部事件总线, 从messagePipe进入
-		case command := <-rf.sendCmdChan:
-			rf.Debug("send command %v", command.Command)
-			switch rf.state.State {
-			case "follower", "candidate":
-				go func(t int) {
-					command.Resp <- SendCmdRespInfo{
-						Term:     t,
-						Index:    -1,
-						IsLeader: false,
-					}
-				}(rf.state.Term)
-			case "leader":
-				// 首先追加日志
-				rf.state.Logs.Append(LogEntry{
-					LogTerm:  rf.state.PersistInfo.Term,
-					LogIndex: len(rf.state.PersistInfo.Logs),
-					Command:  command.Command,
-				})
-				rf.persist(nil)
-				l := rf.state.Logs.LastLog().LogIndex
-				rf.Debug("received command(%v), index would be %v, now logs is %v", command.Command, l, rf.state.Logs)
-				go func(t int, l int) {
-					command.Resp <- SendCmdRespInfo{
-						Term:     t,
-						Index:    l,
-						IsLeader: true,
-					}
-				}(rf.state.PersistInfo.Term, l)
+		default:
+			select {
+			case info := <-rf.snapshotChan:
+				rf.Debug("got snapshot command, logs=%v", rf.state.Logs)
 
-				// 为了尽快同步日志并返回客户端, 需要让定时器尽快过期
-				rf.TimerTimeout()
-			}
-		case input := <-rf.messagePipeLine:
-			rf.Debug("got message")
-			/*
-				if one server’s current
-				term is smaller than the other’s, then it updates its current
-				term to the larger value. If a candidate or leader discovers
-				that its term is out of date, it immediately reverts to follower state.
-				 If a server receives a request with a stale term
-				number, it rejects the request.
-			*/
-			if rf.state.PersistInfo.Term < input.Term {
-				rf.Debug("found self term < remote term, turning into follower of term %v", input.Term)
-				if rf.state.State == "leader" {
-					rf.Debug("leader be follower")
-				}
-				rf.state.State = "follower"
-				rf.state.PersistInfo.Term = input.Term
-				rf.state.PersistInfo.VotedForThisTerm = -1
-				rf.persist(nil)
-
-				/*
-					If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)这个是不需要reset election timeout的
-					注意修改currentTerm、votedFor、log[]其中一个后都要调用persist()方法，我之前就是因为第一个reply term那个点修改了currentTerm但是忘记调用了
-					注意处理过期的RPC回复，student guide里面有写
-
-					Make sure you reset your election timer exactly when Figure 2
-					says you should. Specifically, you should only restart your election
-					timer if a) you get an AppendEntries RPC from the current leader
-					(i.e., if the term in the AppendEntries arguments is outdated, you
-					should not reset your timer); b) you are starting an election; or c)
-					you grant a vote to another peer.
-				*/
-				// timer = time.After(RandElectionTime())
-			}
-
-			switch val := input.Msg.(type) {
-			case *InstallSnapshotRequest:
-				rf.Debug("got InstallSnapshotRequest, lastIncIdx=%v, lastIncTerm=%v, self logs=%v",
-					val.LastIncludedIndex, val.LastIncludedTerm, rf.state.Logs)
-				// 自己的term >= 对方了, 如果对面的term比自己小, 那么直接发信息让对方回到follower
-				if val.Term < rf.state.Term {
-					rf.Debug("but self term(%v) > remote term(%v), sending to make it follower",
-						rf.state.Term, val.Term)
-					go func(t int) {
-						rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
-							ReqTerm: val.Term,
-							Term:    t,
-						})
-					}(rf.state.Term)
+				// 收到裁减log的命令, 需要进行日志裁减, 然后把新的snapshot持久化
+				l, ok := rf.state.Logs.FindLogByIndex(info.Index)
+				if !ok {
+					rf.Debug("got snapshot command, but not found log in logs")
+					info.SnapshotOKChan <- struct{}{}
 					break
 				}
+				rf.state.Logs.TrimLogs(info.Index)
+				rf.state.LastIncludedIndex = l.LogIndex
+				rf.state.LastIncludedTerm = l.LogTerm
+				rf.persist(info.SnapShot)
+				rf.Debug("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
+					info.Index, rf.state.Logs, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm)
 
-				// 当前term相等, 是不可能产生两个leader的
-				if rf.state.State == "leader" {
-					panic("checkme")
+				info.SnapshotOKChan <- struct{}{}
+			case <-rf.reqDead:
+				rf.Debug("dead")
+				rf.reqDeadOK <- struct{}{}
+				// 测试用例会在raft dead后发start, 需要避免问题我采取了个折中的方案
+				go func() {
+					for {
+						c := <-rf.sendCmdChan
+						c.Resp <- SendCmdRespInfo{Term: -1, Index: -1, IsLeader: false}
+					}
+				}()
+				return
+			case <-rf.reqGetState:
+				rf.Debug("rf.reqGetState")
+				go func(t int, isLeader bool) {
+					rf.getStateChan <- GetStateInfo{
+						Term:     t,
+						Isleader: isLeader,
+					}
+				}(rf.state.Term, rf.state.State == "leader")
+			// 选举超时timer
+			case <-rf.timer:
+				rf.Debug("timeout")
+				switch rf.state.State {
+				// 如果是follower超时, 那么进入candidate状态, 并且为自己加一票
+				case "follower":
+					rf.state.State = "candidate"
+					rf.state.ReceivedNAgrees = 1
+					rf.state.PersistInfo.VotedForThisTerm = rf.me
+					rf.state.PersistInfo.Term++
+					rf.persist(nil)
+
+					rf.RandElectionTimer()
+					rf.Debug("just timeout, being candidate, logs = %v", rf.state.Logs)
+
+					// 并发地发送选票请求
+					// 外部会共享这个变量, 为了并发安全我们需要拷贝一份t给协程用
+					lastLog := rf.state.Logs.LastLog()
+					for i := range rf.peers {
+						if i != rf.me {
+							go func(i int, t int, lastLog LogEntry) {
+								rf.sendRequestVoteRequest(i, &RequestVoteRequest{
+									Term:         t,
+									CandidateID:  rf.me,
+									LastLogTerm:  lastLog.LogTerm,
+									LastLogIndex: lastLog.LogIndex,
+								})
+							}(i, rf.state.Term, lastLog)
+						}
+					}
+				// 说明candidate超时了, 加term继续
+				case "candidate":
+					rf.state.State = "candidate"
+					rf.state.ReceivedNAgrees = 1
+					rf.state.PersistInfo.Term++
+					rf.persist(nil)
+					rf.RandElectionTimer()
+
+					rf.Debug("candidate timeout, retrying")
+
+					// 外部会共享这个变量, 为了并发安全我们需要拷贝一份t给协程用
+					for i := range rf.peers {
+						if i != rf.me {
+							go func(i int, t int, lastLog LogEntry) {
+								rf.sendRequestVoteRequest(i, &RequestVoteRequest{
+									Term:         t,
+									CandidateID:  rf.me,
+									LastLogTerm:  lastLog.LogTerm,
+									LastLogIndex: lastLog.LogIndex,
+								})
+							}(i, rf.state.Term, rf.state.Logs.LastLog())
+						}
+					}
+
+				// leader超时是定时器超时, 只需要发送心跳维统治即可
+				case "leader":
+					rf.Debug("timeout, logs=%v, nextIndex=%v, matchIndex=%v, lastIncIndex=%v, lastIncTerm=%v, commitIndex=%v", rf.state.Logs,
+						rf.state.NextLogIndex, rf.state.MatchIndex, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm, rf.state.CommitIndex)
+					for i := range rf.peers {
+						if i != rf.me {
+							rf.LeaderSendLogs(i)
+						}
+					}
+					rf.ResetLeaderTimer()
 				}
+			// 统一的外部事件总线, 从messagePipe进入
+			case command := <-rf.sendCmdChan:
+				rf.Debug("send command %v", command.Command)
+				switch rf.state.State {
+				case "follower", "candidate":
+					go func(t int) {
+						command.Resp <- SendCmdRespInfo{
+							Term:     t,
+							Index:    -1,
+							IsLeader: false,
+						}
+					}(rf.state.Term)
+				case "leader":
+					// 首先追加日志
+					rf.state.Logs.Append(LogEntry{
+						LogTerm:  rf.state.PersistInfo.Term,
+						LogIndex: len(rf.state.PersistInfo.Logs),
+						Command:  command.Command,
+					})
+					rf.persist(nil)
+					l := rf.state.Logs.LastLog().LogIndex
+					rf.Debug("received command(%v), index would be %v, now logs is %v", command.Command, l, rf.state.Logs)
+					go func(t int, l int) {
+						command.Resp <- SendCmdRespInfo{
+							Term:     t,
+							Index:    l,
+							IsLeader: true,
+						}
+					}(rf.state.PersistInfo.Term, l)
 
-				if rf.state.State == "candidate" {
+					// 为了尽快同步日志并返回客户端, 需要让定时器尽快过期
+					rf.TimerTimeout()
+				}
+			case input := <-rf.messagePipeLine:
+				rf.Debug("got message")
+				/*
+					if one server’s current
+					term is smaller than the other’s, then it updates its current
+					term to the larger value. If a candidate or leader discovers
+					that its term is out of date, it immediately reverts to follower state.
+					 If a server receives a request with a stale term
+					number, it rejects the request.
+				*/
+				if rf.state.PersistInfo.Term < input.Term {
+					rf.Debug("found self term < remote term, turning into follower of term %v", input.Term)
+					if rf.state.State == "leader" {
+						rf.Debug("leader be follower")
+					}
 					rf.state.State = "follower"
 					rf.state.PersistInfo.Term = input.Term
-					rf.state.PersistInfo.VotedForThisTerm = rf.me
-					rf.Debug("got installSnapshotRequest from %v, candidate to follower(same term)", val.LeaderID)
+					rf.state.PersistInfo.VotedForThisTerm = -1
 					rf.persist(nil)
+
+					/*
+						If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)这个是不需要reset election timeout的
+						注意修改currentTerm、votedFor、log[]其中一个后都要调用persist()方法，我之前就是因为第一个reply term那个点修改了currentTerm但是忘记调用了
+						注意处理过期的RPC回复，student guide里面有写
+
+						Make sure you reset your election timer exactly when Figure 2
+						says you should. Specifically, you should only restart your election
+						timer if a) you get an AppendEntries RPC from the current leader
+						(i.e., if the term in the AppendEntries arguments is outdated, you
+						should not reset your timer); b) you are starting an election; or c)
+						you grant a vote to another peer.
+					*/
+					// timer = time.After(RandElectionTime())
 				}
 
-				rf.RandElectionTimer()
+				switch val := input.Msg.(type) {
+				case *InstallSnapshotRequest:
+					rf.Debug("got InstallSnapshotRequest, lastIncIdx=%v, lastIncTerm=%v, self logs=%v",
+						val.LastIncludedIndex, val.LastIncludedTerm, rf.state.Logs)
+					// 自己的term >= 对方了, 如果对面的term比自己小, 那么直接发信息让对方回到follower
+					if val.Term < rf.state.Term {
+						rf.Debug("but self term(%v) > remote term(%v), sending to make it follower",
+							rf.state.Term, val.Term)
+						go func(t int) {
+							rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+								ReqTerm: val.Term,
+								Term:    t,
+							})
+						}(rf.state.Term)
+						break
+					}
 
-				/*
-					If existing log entry has same index and term as snapshot’s
-					last included entry, retain log entries following it and reply
-				*/
-				hasEntry, ok := rf.state.Logs.FindLogByIndex(val.LastIncludedIndex)
-				if (ok && hasEntry.LogTerm == val.Term) ||
-					rf.state.CommitIndex >= val.LastIncludedIndex {
-					rf.Debug("already has the entry, ignoring")
+					// 当前term相等, 是不可能产生两个leader的
+					if rf.state.State == "leader" {
+						panic("checkme")
+					}
+
+					if rf.state.State == "candidate" {
+						rf.state.State = "follower"
+						rf.state.PersistInfo.Term = input.Term
+						rf.state.PersistInfo.VotedForThisTerm = rf.me
+						rf.Debug("got installSnapshotRequest from %v, candidate to follower(same term)", val.LeaderID)
+						rf.persist(nil)
+					}
+
+					rf.RandElectionTimer()
+
+					/*
+						If existing log entry has same index and term as snapshot’s
+						last included entry, retain log entries following it and reply
+					*/
+					hasEntry, ok := rf.state.Logs.FindLogByIndex(val.LastIncludedIndex)
+					if (ok && hasEntry.LogTerm == val.Term) ||
+						rf.state.CommitIndex >= val.LastIncludedIndex {
+						rf.Debug("already has the entry, ignoring")
+						go func(t int) {
+							rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
+								ReqTerm:              val.Term,
+								ReqLastIncludedIndex: val.LastIncludedIndex,
+								ReqLastIncludedTerm:  val.LastIncludedTerm,
+								ID:                   rf.me,
+								Term:                 t,
+							})
+						}(rf.state.Term)
+						break
+					}
+
+					rf.Debug("not have the entry, discarding all and putting it in applyCh, len(snapshot)=%v", len(val.Snapshot))
+					// discard all logs
+					var newLogs Logs
+					newLogs = append(newLogs, LogEntry{
+						LogTerm:  val.LastIncludedTerm,
+						LogIndex: val.LastIncludedIndex,
+						// it is for preLog, Command is useless
+						Command: nil,
+					})
+					rf.state.Logs = newLogs
+					rf.state.LastIncludedIndex = val.LastIncludedIndex
+					rf.state.LastIncludedTerm = val.LastIncludedTerm
+					rf.state.CommitIndex = val.LastIncludedIndex
+					rf.persist(val.Snapshot)
+					rf.applyQueue.Push(ApplyMsg{
+						CommandValid:  false,
+						SnapshotValid: true,
+						Snapshot:      val.Snapshot,
+						SnapshotTerm:  val.LastIncludedTerm,
+						SnapshotIndex: val.LastIncludedIndex,
+					})
 					go func(t int) {
 						rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
 							ReqTerm:              val.Term,
@@ -702,433 +801,39 @@ func StateMachine(rf *Raft) {
 							Term:                 t,
 						})
 					}(rf.state.Term)
-					break
-				}
+				case *InstallSnapshotReply:
+					rf.Debug("it is InstallSnapshotReply from %v", val.ID)
 
-				rf.Debug("not have the entry, discarding all and putting it in applyCh, len(snapshot)=%v", len(val.Snapshot))
-				// discard all logs
-				var newLogs Logs
-				newLogs = append(newLogs, LogEntry{
-					LogTerm:  val.LastIncludedTerm,
-					LogIndex: val.LastIncludedIndex,
-					// it is for preLog, Command is useless
-					Command: nil,
-				})
-				rf.state.Logs = newLogs
-				rf.state.LastIncludedIndex = val.LastIncludedIndex
-				rf.state.LastIncludedTerm = val.LastIncludedTerm
-				rf.state.CommitIndex = val.LastIncludedIndex
-				rf.persist(val.Snapshot)
-				rf.applyQueue.Push(ApplyMsg{
-					CommandValid:  false,
-					SnapshotValid: true,
-					Snapshot:      val.Snapshot,
-					SnapshotTerm:  val.LastIncludedTerm,
-					SnapshotIndex: val.LastIncludedIndex,
-				})
-				go func(t int) {
-					rf.sendInstallSnapshotReply(val.LeaderID, &InstallSnapshotReply{
-						ReqTerm:              val.Term,
-						ReqLastIncludedIndex: val.LastIncludedIndex,
-						ReqLastIncludedTerm:  val.LastIncludedTerm,
-						ID:                   rf.me,
-						Term:                 t,
-					})
-				}(rf.state.Term)
-			case *InstallSnapshotReply:
-				rf.Debug("it is InstallSnapshotReply from %v", val.ID)
-
-				if rf.state.State != "leader" {
-					break
-				}
-
-				// 滞后的消息, 忽略
-				if val.ReqTerm != rf.state.Term {
-					break
-				}
-
-				// 来的消息是其它朝代的, 也许是自己之前当过leader, 然后reply滞后了
-				//		这种情况不用管, 之后的心跳会同步它的
-				if val.Term < rf.state.Term {
-					break
-				}
-
-				nextLogMaybeSet := val.ReqLastIncludedIndex + 1
-				rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
-				rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
-				rf.Debug("set server nextLogIndex=%v", rf.state.NextLogIndex[val.ID])
-
-				if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
-					rf.Debug("still have logs tobe send, sending selflogs=%v, nextindex=%v", rf.state.Logs, rf.state.NextLogIndex)
-					rf.LeaderSendLogs(val.ID)
-				}
-
-				sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
-				copy(sortedMatchIndex, rf.state.MatchIndex)
-				sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
-				sort.Ints(sortedMatchIndex)
-				N := sortedMatchIndex[len(rf.peers)/2]
-				if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs.
-					GetByIndex(N).LogTerm == rf.state.PersistInfo.Term {
-
-					oldCommitIndex := rf.state.CommitIndex
-					rf.state.CommitIndex = N
-					flag := false
-					rf.Debug("commit log, matchIdx=%v N=%v oldCommitIndex=%v, now is %v",
-						rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
-					for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
-						flag = true
-						msg := ApplyMsg{
-							CommandValid: true,
-							Command:      rf.state.PersistInfo.Logs[i].Command,
-							CommandIndex: i,
-						}
-						rf.Debug("applied log: %v", msg)
-						rf.applyQueue.Push(msg)
+					if rf.state.State != "leader" {
+						break
 					}
-					if !flag {
-						panic("checkme")
+
+					// 滞后的消息, 忽略
+					if val.ReqTerm != rf.state.Term {
+						break
 					}
-				}
-			case *RequestVoteReply:
-				rf.Debug("it is RequestVoteReply")
-				// 如果是>当前term, 那么马上转变成follower, 更新term
-				/*原文, 就算是VoteReply, 如果发现自己的term落后了, 也需要立马回到follower, 更新term
-				All Servers
-				If RPC request or response contains term T > currentTerm:
-				set currentTerm = T, convert to follower (§5.1)
-				*/
 
-				if val.ReqTerm != rf.state.Term {
-					break
-				}
-
-				// 如果是过去的消息, 直接无视
-				if val.Term != rf.state.PersistInfo.Term {
-					break
-				}
-
-				/*
-					有两种情况:
-					1. candidate竞争失败, 会退到当前term的follower
-					2. 成为leader
-				*/
-				if rf.state.State != "candidate" {
-					break
-				}
-
-				if val.VoteGranted {
-					rf.state.ReceivedNAgrees++
-					rf.Debug("received vote ok, now have %v agreee votes", rf.state.ReceivedNAgrees)
-					if rf.state.ReceivedNAgrees > len(rf.peers)/2 {
-						rf.state.State = "leader"
-						/*
-							上任后, 认为每个节点都同步到了最新的日志
-							for each server, index of the next log entry
-							to send to that server (initialized to leader
-							last log index + 1)
-						*/
-						nextIndex := rf.state.Logs.LastLogIndex() + 1
-						for i := 0; i < len(rf.peers); i++ {
-							rf.state.NextLogIndex[i] = nextIndex
-							rf.state.MatchIndex[i] = 0
-						}
-						rf.Debug("be leader, logs=%v, nextIndex=%v, matchIndex=%v", rf.state.Logs, rf.state.NextLogIndex, rf.state.MatchIndex)
-
-						// 简便方法, 直接超时
-						rf.TimerTimeout()
+					// 来的消息是其它朝代的, 也许是自己之前当过leader, 然后reply滞后了
+					//		这种情况不用管, 之后的心跳会同步它的
+					if val.Term < rf.state.Term {
+						break
 					}
-				}
-			case *RequestVoteRequest:
-				rf.Debug("received RequestVoteRequest from %v, remote last log is index=%v, term=%v, remote term=%v",
-					val.CandidateID, val.LastLogIndex, val.LastLogTerm, val.Term)
-				// 自己的term >= 对方的term, 作为candidate, 拒绝
-				switch rf.state.State {
-				case "candidate":
-					// 自己的term >= val.Term, 那么直接拒绝这个, 给自己的term
-					rf.Debug("disgranted %v to be leader, remote term = %v", val.CandidateID, val.Term)
-					go func(t int) {
-						rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-							Term:        t,
-							VoteGranted: false,
-							ReqTerm:     val.Term,
-						})
-					}(rf.state.Term)
-				// 但是作为follower, 自己的term>=val.Term, 如果自己的term > 对方的term, 那么拒绝
-				case "follower":
-					/*
-						If a server receives a request with a stale term
-						number, it rejects the request.
-					*/
-					if rf.state.Term > val.Term {
-						rf.Debug("disgranted %v to be leader, remote term = %v < myterm",
-							val.CandidateID, val.Term)
-						go func(t int) {
-							rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-								Term:        t,
-								VoteGranted: false,
-								ReqTerm:     val.Term,
-							})
-						}(rf.state.Term)
-					} else {
-						// 这种情况下对面的term==自己的term, 如果自己没投票过, 那么就agree
 
-						if rf.state.Term != val.Term {
-							log.Panic("checkme")
-						}
-
-						if rf.state.PersistInfo.VotedForThisTerm == -1 {
-							// 此外, 还需要管的是对方的日志比自己新
-							lastLog := rf.state.Logs.LastLog()
-							if val.LastLogTerm < lastLog.LogTerm || (val.LastLogTerm == lastLog.LogTerm &&
-								val.LastLogIndex < lastLog.LogIndex) {
-								rf.Debug("disgranted %v to be leader beacuuse remote lastlog(term=%v index=%v) is older than my last log(term=%v index=%v)",
-									val.CandidateID, val.LastLogTerm, val.LastLogIndex, lastLog.LogTerm, lastLog.LogIndex)
-								go func(t int) {
-									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-										Term:        t,
-										VoteGranted: false,
-										ReqTerm:     val.Term,
-									})
-								}(rf.state.Term)
-							} else {
-								rf.Debug("granted %v to be leader, self logs=%v", val.CandidateID, rf.state.Logs)
-								rf.state.PersistInfo.VotedForThisTerm = val.CandidateID
-								rf.persist(nil)
-								go func(t int) {
-									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-										Term:        t,
-										VoteGranted: true,
-										ReqTerm:     val.Term,
-									})
-								}(rf.state.Term)
-
-								// you should only restart your election timer if a)
-								// you get an AppendEntries RPC from the current leader
-								//  (i.e., if the term in the AppendEntries arguments is outdated,
-								// you should not reset your timer); b) you are starting an election; or c)
-								//  you grant a vote to another peer.
-								rf.RandElectionTimer()
-							}
-						} else {
-							rf.Debug("disgranted %v to be leader, ticket is already used to %v", val.CandidateID, rf.state.VotedForThisTerm)
-							go func(t int) {
-								rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-									Term:        t,
-									VoteGranted: false,
-									ReqTerm:     val.Term,
-								})
-							}(rf.state.Term)
-						}
-					}
-				case "leader":
-					// 否则, 拒绝, 自己的term大于登于对方的term, 不能接受提议
-					rf.Debug("disgranted %v to be leader, because it is a leader which term >= remote", val.CandidateID)
-					go func(t int) {
-						rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
-							Term:        t,
-							VoteGranted: false,
-							ReqTerm:     val.Term,
-						})
-					}(rf.state.Term)
-				}
-
-			case *AppendEntriesRequest:
-				// 进入这个case的时候self term >= remote term
-				rf.Debug("got ae from %v, remote term=%v, len of entries=%v, prelog(index=%v term=%v), self logs = %v",
-					val.LeaderID, val.Term, len(val.Entries), val.PrevLogIndex, val.PreLogTerm, rf.state.Logs)
-				entries := make([]LogEntry, 0)
-				for _, v := range val.Entries {
-					en, ok := BytesToLogEntry(v)
-					if !ok {
-						panic("checkme")
-					}
-					entries = append(entries, en)
-				}
-				rf.Debug("entries = %v", entries)
-
-				// 如果对方的term小于自己, 那么久直接拒绝日志, 对方收到term后会立刻回退到follower, 此时不用更新timer
-				if rf.state.Term > val.Term {
-					rf.Debug("got AppendEntriesRequest from %v, but it's term(%v) < self, sending reply to make it a leader", val.LeaderID, val.Term)
-					// 经测试, 必须包含ReqTerm才能保证正确性
-					go func(t int) {
-						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
-							Term:    t,
-							Success: false,
-							ReqTerm: val.Term,
-						})
-					}(rf.state.Term)
-					break
-				}
-
-				// 下面的逻辑是对面的term==自己的term了
-				if rf.state.State == "leader" {
-					panic("checkme")
-				}
-
-				if rf.state.State == "candidate" {
-					rf.state.State = "follower"
-					rf.state.PersistInfo.Term = input.Term
-					rf.state.PersistInfo.VotedForThisTerm = rf.me
-					rf.Debug("got ae from %v, candidate to follower(same term)", val.LeaderID)
-					rf.persist(nil)
-				}
-
-				// 重置timer
-				rf.RandElectionTimer()
-
-				// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
-				rf.Debug("preLogIndex=%v", val.PrevLogIndex)
-				preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
-				if !ok {
-					rf.Debug("no preLog in logs, refusing, preLogIndex=%v preLogTerm=%v", val.PrevLogIndex,
-						val.PreLogTerm)
-					go func(t int) {
-						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
-							ID:             rf.me,
-							Term:           t,
-							PreIndex:       val.PrevLogIndex,
-							Success:        false,
-							NLogsInRequest: len(val.Entries),
-							ConflictIndex:  -1,
-							ReqTerm:        val.Term,
-						})
-					}(rf.state.Term)
-					break
-				}
-
-				// 如果已经拥有preLog, 那么需要检查是否应该丢弃log
-				// preLog匹配不上, 要求leader回溯
-				if preLog.LogTerm != val.PreLogTerm {
-					conflictTerm := rf.state.Logs.GetByIndex(val.PrevLogIndex).LogTerm
-					i := val.PrevLogIndex - rf.state.Logs[0].LogIndex
-					for ; i > 0; i-- {
-						if rf.state.Logs[i].LogTerm != conflictTerm {
-							break
-						}
-					}
-					rf.Debug("prelog conflict, self logs = %v", rf.state.Logs)
-					rf.state.Logs.TruncateBy(val.PrevLogIndex)
-					rf.Debug("prelog conflict, now logs = %v", rf.state.Logs)
-					rf.persist(nil)
-					go func(t int) {
-						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
-							ID:             rf.me,
-							Term:           t,
-							PreIndex:       val.PrevLogIndex,
-							Success:        false,
-							NLogsInRequest: len(val.Entries),
-							ConflictIndex:  i + 1,
-							ReqTerm:        val.Term,
-						})
-					}(rf.state.Term)
-					break
-				}
-
-				rf.Debug("prelog is matched")
-				// preLog能匹配了, 如果Entries没有, 那么必然成功, 此时同步preLog那里
-				if len(entries) == 0 {
-					rf.Commit(val.LeaderCommit, preLog)
-				} else {
-					// 此时entries是有很多日志的, 需要进行追加
-					for _, entry := range entries {
-						if checkSelfLog, ok := rf.state.Logs.FindLogByIndex(entry.LogIndex); ok {
-							if checkSelfLog.LogTerm != entry.LogTerm {
-								rf.Debug("got log conflict, truncating")
-								rf.state.Logs.TruncateBy(entry.LogIndex)
-								rf.state.Logs.Append(entry)
-							}
-						} else {
-							rf.state.Logs.Append(entry)
-						}
-					}
-					rf.persist(nil)
-					rf.Commit(val.LeaderCommit, entries[len(entries)-1])
-				}
-
-				go func(t int) {
-					rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
-						ID:             rf.me,
-						Term:           t,
-						PreIndex:       val.PrevLogIndex,
-						Success:        true,
-						NLogsInRequest: len(entries),
-						ReqTerm:        val.Term,
-					})
-				}(rf.state.Term)
-			case *AppendEntriesReply:
-				rf.Debug("it is AppendEntriesReply")
-				// 此时自己的term>=对方的term
-				// 只有leader理这个信息
-				if rf.state.State != "leader" {
-					break
-				}
-
-				if val.ReqTerm != rf.state.Term {
-					break
-				}
-
-				// 来的消息是其它朝代的, 也许是自己之前当过leader, 然会reply滞后了
-				//		这种情况不用管, 之后的心跳会同步它的
-				if val.Term < rf.state.Term {
-					break
-				}
-
-				// 如果已经在当前日志找不到前一个日志了, 就应当发送installSnapshot了, 我觉得下一次心跳发比较合适, 因为这可能是过时的信息
-				preEntry, ok := rf.state.Logs.FindLogByIndex(rf.state.NextLogIndex[val.ID] - 1)
-				if !ok {
-					rf.Debug("cannot find preLog, waiting heartbeat send snapshot")
-					break
-				}
-
-				// 如果找到了前一个日志, 但是index不相等, 说明过时了, 直接忽略就行了
-				if val.PreIndex != preEntry.LogIndex {
-					break
-				}
-
-				if !val.Success {
-					if val.ConflictIndex == -1 {
-						l, ok := rf.state.Logs.FindLogByIndex(val.PreIndex)
-						if !ok {
-							panic("checkme")
-						}
-						// 5 6 7 8
-						j := l.LogIndex - rf.state.Logs[0].LogIndex
-						for j >= 0 && rf.state.Logs.At(j).LogTerm == l.LogTerm {
-							j--
-						}
-						rf.Debug("case2, j+1=%v", j+1)
-						rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], rf.state.Logs.At(j+1).LogIndex)
-					} else {
-						rf.state.NextLogIndex[val.ID] = min(val.ConflictIndex, rf.state.NextLogIndex[val.ID])
-						rf.Debug("case2, ConflictIndex=%v", val.ConflictIndex)
-						if rf.state.NextLogIndex[val.ID] == 0 {
-							rf.Debug("%v", val)
-							panic("checkme")
-						}
-					}
-					rf.Debug("got refuse from %v, now nextIndex=%v", val.ID, rf.state.NextLogIndex[val.ID])
-					rf.LeaderSendLogs(val.ID)
-					// success, 那么加nextIndex, 加matchIndex
-				} else {
-					nextLogMaybeSet := val.PreIndex + val.NLogsInRequest + 1
+					nextLogMaybeSet := val.ReqLastIncludedIndex + 1
 					rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
 					rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
+					rf.Debug("set server nextLogIndex=%v", rf.state.NextLogIndex[val.ID])
 
 					if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
+						rf.Debug("still have logs tobe send, sending selflogs=%v, nextindex=%v", rf.state.Logs, rf.state.NextLogIndex)
 						rf.LeaderSendLogs(val.ID)
 					}
-					rf.Debug("set server %v nextIndex = %v", val.ID, rf.state.NextLogIndex[val.ID])
 
-					// If there exists an N such that N > commitIndex,
-					//  a majority of matchIndex[i] ≥ N, and log[N].
-					// term == currentTerm: set commitIndex = N
 					sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
 					copy(sortedMatchIndex, rf.state.MatchIndex)
-					sortedMatchIndex[rf.me] = rf.state.Logs.LastLogIndex()
+					sortedMatchIndex[rf.me] = len(rf.state.PersistInfo.Logs) - 1
 					sort.Ints(sortedMatchIndex)
 					N := sortedMatchIndex[len(rf.peers)/2]
-					rf.Debug("leader checking can commit %v, N = %v", sortedMatchIndex, N)
 					if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs.
 						GetByIndex(N).LogTerm == rf.state.PersistInfo.Term {
 
@@ -1139,13 +844,9 @@ func StateMachine(rf *Raft) {
 							rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
 						for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
 							flag = true
-							l, ok := rf.state.Logs.FindLogByIndex(i)
-							if !ok {
-								panic("checkme")
-							}
 							msg := ApplyMsg{
 								CommandValid: true,
-								Command:      l.Command,
+								Command:      rf.state.PersistInfo.Logs[i].Command,
 								CommandIndex: i,
 							}
 							rf.Debug("applied log: %v", msg)
@@ -1153,6 +854,372 @@ func StateMachine(rf *Raft) {
 						}
 						if !flag {
 							panic("checkme")
+						}
+					}
+				case *RequestVoteReply:
+					rf.Debug("it is RequestVoteReply")
+					// 如果是>当前term, 那么马上转变成follower, 更新term
+					/*原文, 就算是VoteReply, 如果发现自己的term落后了, 也需要立马回到follower, 更新term
+					All Servers
+					If RPC request or response contains term T > currentTerm:
+					set currentTerm = T, convert to follower (§5.1)
+					*/
+
+					if val.ReqTerm != rf.state.Term {
+						break
+					}
+
+					// 如果是过去的消息, 直接无视
+					if val.Term != rf.state.PersistInfo.Term {
+						break
+					}
+
+					/*
+						有两种情况:
+						1. candidate竞争失败, 会退到当前term的follower
+						2. 成为leader
+					*/
+					if rf.state.State != "candidate" {
+						break
+					}
+
+					if val.VoteGranted {
+						rf.state.ReceivedNAgrees++
+						rf.Debug("received vote ok, now have %v agreee votes", rf.state.ReceivedNAgrees)
+						if rf.state.ReceivedNAgrees > len(rf.peers)/2 {
+							rf.state.State = "leader"
+							/*
+								上任后, 认为每个节点都同步到了最新的日志
+								for each server, index of the next log entry
+								to send to that server (initialized to leader
+								last log index + 1)
+							*/
+							nextIndex := rf.state.Logs.LastLogIndex() + 1
+							for i := 0; i < len(rf.peers); i++ {
+								rf.state.NextLogIndex[i] = nextIndex
+								rf.state.MatchIndex[i] = 0
+							}
+							rf.Debug("be leader, logs=%v, nextIndex=%v, matchIndex=%v", rf.state.Logs, rf.state.NextLogIndex, rf.state.MatchIndex)
+
+							// 简便方法, 直接超时
+							rf.TimerTimeout()
+						}
+					}
+				case *RequestVoteRequest:
+					rf.Debug("received RequestVoteRequest from %v, remote last log is index=%v, term=%v, remote term=%v",
+						val.CandidateID, val.LastLogIndex, val.LastLogTerm, val.Term)
+					// 自己的term >= 对方的term, 作为candidate, 拒绝
+					switch rf.state.State {
+					case "candidate":
+						// 自己的term >= val.Term, 那么直接拒绝这个, 给自己的term
+						rf.Debug("disgranted %v to be leader, remote term = %v", val.CandidateID, val.Term)
+						go func(t int) {
+							rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+								Term:        t,
+								VoteGranted: false,
+								ReqTerm:     val.Term,
+							})
+						}(rf.state.Term)
+					// 但是作为follower, 自己的term>=val.Term, 如果自己的term > 对方的term, 那么拒绝
+					case "follower":
+						/*
+							If a server receives a request with a stale term
+							number, it rejects the request.
+						*/
+						if rf.state.Term > val.Term {
+							rf.Debug("disgranted %v to be leader, remote term = %v < myterm",
+								val.CandidateID, val.Term)
+							go func(t int) {
+								rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+									Term:        t,
+									VoteGranted: false,
+									ReqTerm:     val.Term,
+								})
+							}(rf.state.Term)
+						} else {
+							// 这种情况下对面的term==自己的term, 如果自己没投票过, 那么就agree
+
+							if rf.state.Term != val.Term {
+								log.Panic("checkme")
+							}
+
+							if rf.state.PersistInfo.VotedForThisTerm == -1 {
+								// 此外, 还需要管的是对方的日志比自己新
+								lastLog := rf.state.Logs.LastLog()
+								if val.LastLogTerm < lastLog.LogTerm || (val.LastLogTerm == lastLog.LogTerm &&
+									val.LastLogIndex < lastLog.LogIndex) {
+									rf.Debug("disgranted %v to be leader beacuuse remote lastlog(term=%v index=%v) is older than my last log(term=%v index=%v)",
+										val.CandidateID, val.LastLogTerm, val.LastLogIndex, lastLog.LogTerm, lastLog.LogIndex)
+									go func(t int) {
+										rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+											Term:        t,
+											VoteGranted: false,
+											ReqTerm:     val.Term,
+										})
+									}(rf.state.Term)
+								} else {
+									rf.Debug("granted %v to be leader, self logs=%v", val.CandidateID, rf.state.Logs)
+									rf.state.PersistInfo.VotedForThisTerm = val.CandidateID
+									rf.persist(nil)
+									go func(t int) {
+										rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+											Term:        t,
+											VoteGranted: true,
+											ReqTerm:     val.Term,
+										})
+									}(rf.state.Term)
+
+									// you should only restart your election timer if a)
+									// you get an AppendEntries RPC from the current leader
+									//  (i.e., if the term in the AppendEntries arguments is outdated,
+									// you should not reset your timer); b) you are starting an election; or c)
+									//  you grant a vote to another peer.
+									rf.RandElectionTimer()
+								}
+							} else {
+								rf.Debug("disgranted %v to be leader, ticket is already used to %v", val.CandidateID, rf.state.VotedForThisTerm)
+								go func(t int) {
+									rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+										Term:        t,
+										VoteGranted: false,
+										ReqTerm:     val.Term,
+									})
+								}(rf.state.Term)
+							}
+						}
+					case "leader":
+						// 否则, 拒绝, 自己的term大于登于对方的term, 不能接受提议
+						rf.Debug("disgranted %v to be leader, because it is a leader which term >= remote", val.CandidateID)
+						go func(t int) {
+							rf.sendRequestVoteReply(val.CandidateID, &RequestVoteReply{
+								Term:        t,
+								VoteGranted: false,
+								ReqTerm:     val.Term,
+							})
+						}(rf.state.Term)
+					}
+
+				case *AppendEntriesRequest:
+					// 进入这个case的时候self term >= remote term
+					rf.Debug("got ae from %v, remote term=%v, len of entries=%v, prelog(index=%v term=%v), self logs = %v",
+						val.LeaderID, val.Term, len(val.Entries), val.PrevLogIndex, val.PreLogTerm, rf.state.Logs)
+					entries := make([]LogEntry, 0)
+					for _, v := range val.Entries {
+						en, ok := BytesToLogEntry(v)
+						if !ok {
+							panic("checkme")
+						}
+						entries = append(entries, en)
+					}
+					rf.Debug("entries = %v", entries)
+
+					// 如果对方的term小于自己, 那么久直接拒绝日志, 对方收到term后会立刻回退到follower, 此时不用更新timer
+					if rf.state.Term > val.Term {
+						rf.Debug("got AppendEntriesRequest from %v, but it's term(%v) < self, sending reply to make it a leader", val.LeaderID, val.Term)
+						// 经测试, 必须包含ReqTerm才能保证正确性
+						go func(t int) {
+							rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
+								Term:    t,
+								Success: false,
+								ReqTerm: val.Term,
+							})
+						}(rf.state.Term)
+						break
+					}
+
+					// 下面的逻辑是对面的term==自己的term了
+					if rf.state.State == "leader" {
+						panic("checkme")
+					}
+
+					if rf.state.State == "candidate" {
+						rf.state.State = "follower"
+						rf.state.PersistInfo.Term = input.Term
+						rf.state.PersistInfo.VotedForThisTerm = rf.me
+						rf.Debug("got ae from %v, candidate to follower(same term)", val.LeaderID)
+						rf.persist(nil)
+					}
+
+					// 重置timer
+					rf.RandElectionTimer()
+
+					// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
+					rf.Debug("preLogIndex=%v", val.PrevLogIndex)
+					preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
+					if !ok {
+						rf.Debug("no preLog in logs, refusing, preLogIndex=%v preLogTerm=%v", val.PrevLogIndex,
+							val.PreLogTerm)
+						go func(t int) {
+							rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
+								ID:             rf.me,
+								Term:           t,
+								PreIndex:       val.PrevLogIndex,
+								Success:        false,
+								NLogsInRequest: len(val.Entries),
+								ConflictIndex:  -1,
+								ReqTerm:        val.Term,
+							})
+						}(rf.state.Term)
+						break
+					}
+
+					// 如果已经拥有preLog, 那么需要检查是否应该丢弃log
+					// preLog匹配不上, 要求leader回溯
+					if preLog.LogTerm != val.PreLogTerm {
+						conflictTerm := rf.state.Logs.GetByIndex(val.PrevLogIndex).LogTerm
+						i := val.PrevLogIndex - rf.state.Logs[0].LogIndex
+						for ; i > 0; i-- {
+							if rf.state.Logs[i].LogTerm != conflictTerm {
+								break
+							}
+						}
+						rf.Debug("prelog conflict, self logs = %v", rf.state.Logs)
+						rf.state.Logs.TruncateBy(val.PrevLogIndex)
+						rf.Debug("prelog conflict, now logs = %v", rf.state.Logs)
+						rf.persist(nil)
+						go func(t int) {
+							rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
+								ID:             rf.me,
+								Term:           t,
+								PreIndex:       val.PrevLogIndex,
+								Success:        false,
+								NLogsInRequest: len(val.Entries),
+								ConflictIndex:  i + 1,
+								ReqTerm:        val.Term,
+							})
+						}(rf.state.Term)
+						break
+					}
+
+					rf.Debug("prelog is matched")
+					// preLog能匹配了, 如果Entries没有, 那么必然成功, 此时同步preLog那里
+					if len(entries) == 0 {
+						rf.Commit(val.LeaderCommit, preLog)
+					} else {
+						// 此时entries是有很多日志的, 需要进行追加
+						for _, entry := range entries {
+							if checkSelfLog, ok := rf.state.Logs.FindLogByIndex(entry.LogIndex); ok {
+								if checkSelfLog.LogTerm != entry.LogTerm {
+									rf.Debug("got log conflict, truncating")
+									rf.state.Logs.TruncateBy(entry.LogIndex)
+									rf.state.Logs.Append(entry)
+								}
+							} else {
+								rf.state.Logs.Append(entry)
+							}
+						}
+						rf.persist(nil)
+						rf.Commit(val.LeaderCommit, entries[len(entries)-1])
+					}
+
+					go func(t int) {
+						rf.sendAppendEntriesReply(val.LeaderID, &AppendEntriesReply{
+							ID:             rf.me,
+							Term:           t,
+							PreIndex:       val.PrevLogIndex,
+							Success:        true,
+							NLogsInRequest: len(entries),
+							ReqTerm:        val.Term,
+						})
+					}(rf.state.Term)
+				case *AppendEntriesReply:
+					rf.Debug("it is AppendEntriesReply")
+					// 此时自己的term>=对方的term
+					// 只有leader理这个信息
+					if rf.state.State != "leader" {
+						break
+					}
+
+					if val.ReqTerm != rf.state.Term {
+						break
+					}
+
+					// 来的消息是其它朝代的, 也许是自己之前当过leader, 然会reply滞后了
+					//		这种情况不用管, 之后的心跳会同步它的
+					if val.Term < rf.state.Term {
+						break
+					}
+
+					// 如果已经在当前日志找不到前一个日志了, 就应当发送installSnapshot了, 我觉得下一次心跳发比较合适, 因为这可能是过时的信息
+					preEntry, ok := rf.state.Logs.FindLogByIndex(rf.state.NextLogIndex[val.ID] - 1)
+					if !ok {
+						rf.Debug("cannot find preLog, waiting heartbeat send snapshot")
+						break
+					}
+
+					// 如果找到了前一个日志, 但是index不相等, 说明过时了, 直接忽略就行了
+					if val.PreIndex != preEntry.LogIndex {
+						break
+					}
+
+					if !val.Success {
+						if val.ConflictIndex == -1 {
+							l, ok := rf.state.Logs.FindLogByIndex(val.PreIndex)
+							if !ok {
+								panic("checkme")
+							}
+							// 5 6 7 8
+							j := l.LogIndex - rf.state.Logs[0].LogIndex
+							for j >= 0 && rf.state.Logs.At(j).LogTerm == l.LogTerm {
+								j--
+							}
+							rf.Debug("case2, j+1=%v", j+1)
+							rf.state.NextLogIndex[val.ID] = min(rf.state.NextLogIndex[val.ID], rf.state.Logs.At(j+1).LogIndex)
+						} else {
+							rf.state.NextLogIndex[val.ID] = min(val.ConflictIndex, rf.state.NextLogIndex[val.ID])
+							rf.Debug("case2, ConflictIndex=%v", val.ConflictIndex)
+							if rf.state.NextLogIndex[val.ID] == 0 {
+								rf.Debug("%v", val)
+								panic("checkme")
+							}
+						}
+						rf.Debug("got refuse from %v, now nextIndex=%v", val.ID, rf.state.NextLogIndex[val.ID])
+						rf.LeaderSendLogs(val.ID)
+						// success, 那么加nextIndex, 加matchIndex
+					} else {
+						nextLogMaybeSet := val.PreIndex + val.NLogsInRequest + 1
+						rf.state.NextLogIndex[val.ID] = max(rf.state.NextLogIndex[val.ID], nextLogMaybeSet)
+						rf.state.MatchIndex[val.ID] = rf.state.NextLogIndex[val.ID] - 1
+
+						if rf.state.NextLogIndex[val.ID] != rf.state.Logs.LastLog().LogIndex+1 {
+							rf.LeaderSendLogs(val.ID)
+						}
+						rf.Debug("set server %v nextIndex = %v", val.ID, rf.state.NextLogIndex[val.ID])
+
+						// If there exists an N such that N > commitIndex,
+						//  a majority of matchIndex[i] ≥ N, and log[N].
+						// term == currentTerm: set commitIndex = N
+						sortedMatchIndex := make([]int, len(rf.state.MatchIndex))
+						copy(sortedMatchIndex, rf.state.MatchIndex)
+						sortedMatchIndex[rf.me] = rf.state.Logs.LastLogIndex()
+						sort.Ints(sortedMatchIndex)
+						N := sortedMatchIndex[len(rf.peers)/2]
+						rf.Debug("leader checking can commit %v, N = %v", sortedMatchIndex, N)
+						if N > rf.state.CommitIndex && rf.state.PersistInfo.Logs.
+							GetByIndex(N).LogTerm == rf.state.PersistInfo.Term {
+
+							oldCommitIndex := rf.state.CommitIndex
+							rf.state.CommitIndex = N
+							flag := false
+							rf.Debug("commit log, matchIdx=%v N=%v oldCommitIndex=%v, now is %v",
+								rf.state.MatchIndex, N, oldCommitIndex, rf.state.CommitIndex)
+							for i := oldCommitIndex + 1; i <= rf.state.CommitIndex; i++ {
+								flag = true
+								l, ok := rf.state.Logs.FindLogByIndex(i)
+								if !ok {
+									panic("checkme")
+								}
+								msg := ApplyMsg{
+									CommandValid: true,
+									Command:      l.Command,
+									CommandIndex: i,
+								}
+								rf.Debug("applied log: %v", msg)
+								rf.applyQueue.Push(msg)
+							}
+							if !flag {
+								panic("checkme")
+							}
 						}
 					}
 				}

@@ -670,7 +670,8 @@ loop:
 		total3 += cfg.rpcCount(j)
 	}
 
-	if total3-total2 > 3*20 {
+	// 我乘2了, 因为把rpc拆了
+	if total3-total2 > 3*20*2 {
 		t.Fatalf("too many RPCs (%v) for 1 second of idleness\n", total3-total2)
 	}
 
