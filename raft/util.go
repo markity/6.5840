@@ -5,7 +5,7 @@ import (
 )
 
 // Debugging
-const Debug = true
+const doDebug = false
 
 type unboundedQueue struct {
 	m sync.Mutex
@@ -13,7 +13,7 @@ type unboundedQueue struct {
 	q []interface{}
 }
 
-func NewUnboundedQueue() *unboundedQueue {
+func newUnboundedQueue() *unboundedQueue {
 	q := &unboundedQueue{}
 	q.c = sync.NewCond(&q.m)
 	q.q = make([]interface{}, 0)
