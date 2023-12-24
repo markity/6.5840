@@ -15,7 +15,7 @@ Test 50 times and use 8 workers:
 
 ```bash
 > cd raft
-> python3 ./dtest.py -n 50 -p 8 2A 2B 2C 2D 3A
+> python3 ./dtest.py -n 50 -p 8 2A 2B 2C 2D
 ```
 
 ### Ref
