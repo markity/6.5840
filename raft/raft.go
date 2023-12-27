@@ -33,6 +33,9 @@ type Raft struct {
 	reqGetState  chan struct{}
 	getStateChan chan GetStateInfo
 
+	reqGetRaftStateSizeChan chan struct{}
+	getRaftStateSizeChan    chan int64
+
 	// 发送命令的Channel, 以及反馈结果的管道
 	sendCmdChan chan SendCmdChanInfo
 
@@ -59,6 +62,13 @@ func (rf *Raft) GetState() (int, bool) {
 	s := <-rf.getStateChan
 
 	return s.Term, s.Isleader
+}
+
+func (rf *Raft) GetRaftStateSize() int64 {
+	rf.reqGetRaftStateSizeChan <- struct{}{}
+	s := <-rf.getRaftStateSizeChan
+
+	return s
 }
 
 // save Raft's persistent state to stable storage,
@@ -91,7 +101,7 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	r := bytes.NewBuffer(data)
+	r := bytes.NewReader(data)
 	d := labgob.NewDecoder(r)
 	if err := d.Decode(&rf.state.PersistInfo); err != nil {
 		panic(err)
@@ -119,6 +129,12 @@ func (rf *Raft) debug(format string, args ...interface{}) {
 		s += format + "\n"
 		log.Printf(s, args...)
 	}
+}
+
+func (rf *Raft) debugForce(format string, args ...interface{}) {
+	s := fmt.Sprintf("%v(%v term=%v): ", rf.me, rf.state.State, rf.state.Term)
+	s += format + "\n"
+	log.Printf(s, args...)
 }
 
 func (rf *Raft) randElectionTimer() {
@@ -429,6 +445,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyQueue = newUnboundedQueue()
 	rf.reqDeadOK = make(chan struct{})
 	rf.snapshotChan = make(chan DoSnapshotInfo)
+	rf.getRaftStateSizeChan = make(chan int64)
+	rf.reqGetRaftStateSizeChan = make(chan struct{})
 
 	go func() {
 		for {
@@ -458,6 +476,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // broadcastTime ≪ electionTimeout ≪ MTBF
 
 func stateMachine(rf *Raft) {
+	p := PersistInfo{}
+	labgob.NewDecoder(bytes.NewReader(rf.persister.ReadRaftState())).Decode(&p)
+	log.Printf("%v read from disk comfirm2: %v\n", rf.me, p.LastIncludedIndex)
+
 	rf.readPersist(rf.persister.ReadRaftState())
 	if doDebug {
 		log.Printf("%v Read From Persister: %#v\n", rf.me, rf.state.PersistInfo)
@@ -481,6 +503,7 @@ func stateMachine(rf *Raft) {
 			SnapshotIndex: rf.state.LastIncludedIndex,
 		})
 	}
+	rf.debugForce("startup LasIncIndex=%v", rf.state.LastIncludedIndex)
 
 	for {
 		select {
@@ -550,8 +573,13 @@ func stateMachine(rf *Raft) {
 			}
 		default:
 			select {
+			case <-rf.reqGetRaftStateSizeChan:
+				sz := rf.persister.RaftStateSize()
+				go func() {
+					rf.getRaftStateSizeChan <- int64(sz)
+				}()
 			case info := <-rf.snapshotChan:
-				rf.debug("got snapshot command, logs=%v", rf.state.Logs)
+				rf.debug("got snapshot command, idx=%v logs=%v", info.Index, rf.state.Logs)
 
 				// 收到裁减log的命令, 需要进行日志裁减, 然后把新的snapshot持久化
 				l, ok := rf.state.Logs.FindLogByIndex(info.Index)
@@ -564,7 +592,7 @@ func stateMachine(rf *Raft) {
 				rf.state.LastIncludedIndex = l.LogIndex
 				rf.state.LastIncludedTerm = l.LogTerm
 				rf.persist(info.SnapShot)
-				rf.debug("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
+				rf.debugForce("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
 					info.Index, rf.state.Logs, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm)
 
 				info.SnapshotOKChan <- struct{}{}
@@ -1002,6 +1030,7 @@ func stateMachine(rf *Raft) {
 					}
 
 				case *appendEntriesRequest:
+					originPreLogIdx := val.PrevLogIndex
 					// 进入这个case的时候self term >= remote term
 					rf.debug("got ae from %v, remote term=%v, len of entries=%v, prelog(index=%v term=%v), self logs = %v",
 						val.LeaderID, val.Term, len(val.Entries), val.PrevLogIndex, val.PreLogTerm, rf.state.Logs)
@@ -1047,10 +1076,23 @@ func stateMachine(rf *Raft) {
 
 					// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
 					rf.debug("preLogIndex=%v", val.PrevLogIndex)
-					preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
-					if !ok {
-						rf.debug("no preLog in logs, refusing, preLogIndex=%v preLogTerm=%v", val.PrevLogIndex,
-							val.PreLogTerm)
+					// 1258 [1259 1260 1261 1262 1263 1264]
+					// 1264
+					if val.PrevLogIndex+len(entries) <= rf.state.CommitIndex {
+						go func(t int) {
+							rf.sendAppendEntriesReply(val.LeaderID, &appendEntriesReply{
+								ID:             rf.me,
+								Term:           t,
+								PreIndex:       val.PrevLogIndex,
+								Success:        true,
+								NLogsInRequest: len(entries),
+								ReqTerm:        val.Term,
+							})
+						}(rf.state.Term)
+						break
+					}
+
+					if rf.state.Logs.LastLog().LogIndex < val.PrevLogIndex {
 						go func(t int) {
 							rf.sendAppendEntriesReply(val.LeaderID, &appendEntriesReply{
 								ID:             rf.me,
@@ -1063,6 +1105,21 @@ func stateMachine(rf *Raft) {
 							})
 						}(rf.state.Term)
 						break
+					}
+
+					// 1258 [1259 1260 1261]
+					// 1260
+					preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
+					if !ok {
+						fmt.Println(rf.state.LastIncludedIndex, val.PrevLogIndex)
+						preLogNew := entries[rf.state.LastIncludedIndex-val.PrevLogIndex-1]
+						entries = entries[rf.state.LastIncludedIndex-val.PrevLogIndex:]
+						val.PrevLogIndex = preLogNew.LogIndex
+						val.PreLogTerm = preLogNew.LogTerm
+						preLog, ok = rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
+						if !ok {
+							panic("checkme")
+						}
 					}
 
 					// 如果已经拥有preLog, 那么需要检查是否应该丢弃log
@@ -1118,9 +1175,9 @@ func stateMachine(rf *Raft) {
 						rf.sendAppendEntriesReply(val.LeaderID, &appendEntriesReply{
 							ID:             rf.me,
 							Term:           t,
-							PreIndex:       val.PrevLogIndex,
+							PreIndex:       originPreLogIdx,
 							Success:        true,
-							NLogsInRequest: len(entries),
+							NLogsInRequest: len(val.Entries),
 							ReqTerm:        val.Term,
 						})
 					}(rf.state.Term)

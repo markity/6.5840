@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 
@@ -46,33 +47,31 @@ type KVServer struct {
 	mu sync.Mutex
 	// clientID -> reqID的映射, 防止client重复发送
 	// 当op == nil时代表已经start进去了, 但是还没被apply, 需要等在channel上
-	lastAppliedReq map[int]op
-	notification   map[int][]notifyStruct
-	data           map[string]string
+	lastAppliedReq   map[int]op
+	notification     map[int][]notifyStruct
+	lastAppliedIndex int64
+	data             map[string]string
 }
 
 type notifyStruct struct {
 	term   int
 	typ    string
 	reqid  int64
-	notify chan interface{}
+	notify chan notify
 }
 
-type getNotify struct {
+type notify struct {
 	NoLeader bool
-	Exists   bool
-	Value    string
-}
 
-type putAppendNotify struct {
-	NoLeader bool
+	// useful for get notify
+	Exists bool
+	Value  string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	dPrintf("[server%v] Get command from clerk%v, reqid=%v", kv.me, args.ClientID, args.ReqID)
 	kv.mu.Lock()
-	dPrintf("[server%v] Get command from clerk%v, reqid=%v after lock", kv.me, args.ClientID, args.ReqID)
-	_, term, leader := kv.rf.Start(op{
+	idx, term, leader := kv.rf.Start(op{
 		Type:     CommandTypeGet,
 		Key:      args.Key,
 		ClientID: args.ClientID,
@@ -85,9 +84,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	dPrintf("[server%v] is leader, now waiting notify", kv.me)
+	dPrintf("[server%v] is leader, now waiting notify, log_index willbe=%v", kv.me, idx)
 
-	notifyC := make(chan interface{}, 1)
+	notifyC := make(chan notify, 1)
 	kv.notification[args.ClientID] = append(kv.notification[args.ClientID], notifyStruct{
 		typ:    "Get",
 		term:   term,
@@ -98,24 +97,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 
 	n := <-notifyC
-	p := n.(getNotify)
-	dPrintf("[server%v] got notify", kv.me)
-	if p.NoLeader {
+	dPrintf("[server%v] got notify %v, reqid=%v", kv.me, n, args.ReqID)
+	if n.NoLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	if !p.Exists {
+	if !n.Exists {
 		reply.Err = ErrNoKey
 		return
 	}
 	reply.Err = OK
-	reply.Value = p.Value
+	reply.Value = n.Value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	dPrintf("[server%v] PutAppend is called", kv.me)
 	kv.mu.Lock()
-	dPrintf("[server%v] PutAppend is called after lock", kv.me)
 	var typ commandType
 	if args.Op == "Append" {
 		typ = CommandTypeAppend
@@ -124,7 +121,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		panic("checkme")
 	}
-	_, term, leader := kv.rf.Start(op{
+
+	// 4 1
+	idx, term, leader := kv.rf.Start(op{
 		Type:     typ,
 		Key:      args.Key,
 		ClientID: args.ClientID,
@@ -138,7 +137,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	notifyC := make(chan interface{}, 1)
+	dPrintf("[server%v] is leader, now waiting notify, log_index willbe=%v", kv.me, idx)
+
+	notifyC := make(chan notify, 1)
 	kv.notification[args.ClientID] = append(kv.notification[args.ClientID], notifyStruct{
 		typ:    args.Op,
 		term:   term,
@@ -148,8 +149,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	n := <-notifyC
-	p := (n).(putAppendNotify)
-	if p.NoLeader {
+	if n.NoLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
@@ -165,7 +165,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
-	dPrintf("[server%v] kill is called", kv.me)
 	kv.deadReq <- struct{}{}
 	<-kv.deadOk
 }
@@ -212,74 +211,136 @@ func poller(kv *KVServer) {
 	for {
 		select {
 		case <-kv.deadReq:
-			dPrintf("[server%v] is killed in", kv.me)
+			kv.mu.Lock()
+			dPrintf("[server%v poller] be killed", kv.me)
 			kv.rf.Kill()
+			kv.mu.Unlock()
 			kv.deadOk <- struct{}{}
-			dPrintf("[server%v] is killed out", kv.me)
 			return
 		case apply := <-kv.applyCh:
 			dPrintf("[server%v poller] applyCh got %v", kv.me, apply)
-			opeartion := apply.Command.(op)
 
 			kv.mu.Lock()
 
-			// 保证幂等
-			if opeartion.ReqID != kv.lastAppliedReq[opeartion.ClientID].ReqID {
-				kv.lastAppliedReq[opeartion.ClientID] = opeartion
-				switch opeartion.Type {
-				case CommandTypeAppend:
-					kv.data[opeartion.Key] = kv.data[opeartion.Key] + opeartion.Data
-				case CommandTypeGet:
-					// DO NOTHING
-				case CommandTypePut:
-					kv.data[opeartion.Key] = opeartion.Data
+			if apply.CommandValid {
+				dPrintf("[server%v poller] got command apply", kv.me)
+
+				opeartion := apply.Command.(op)
+
+				// 保证幂等
+				if opeartion.ReqID > kv.lastAppliedReq[opeartion.ClientID].ReqID {
+					kv.lastAppliedReq[opeartion.ClientID] = opeartion
+					switch opeartion.Type {
+					case CommandTypeAppend:
+						kv.data[opeartion.Key] = kv.data[opeartion.Key] + opeartion.Data
+						dPrintf("got append now data is: %v", kv.data)
+					case CommandTypeGet:
+						// DO NOTHING
+					case CommandTypePut:
+						kv.data[opeartion.Key] = opeartion.Data
+					}
 				}
+
+				// 做通知
+				newNotify := make([]notifyStruct, 0)
+				switch opeartion.Type {
+				case CommandTypeAppend, CommandTypePut:
+					for _, v := range kv.notification[opeartion.ClientID] {
+						// if v.typ != "Put" && v.typ != "Append" {
+						// 	continue
+						// }
+						if apply.CommandTerm != v.term {
+							v.notify <- notify{
+								NoLeader: true,
+							}
+						} else if v.reqid == opeartion.ReqID {
+							v.notify <- notify{
+								NoLeader: false,
+							}
+						} else {
+							newNotify = append(newNotify, v)
+						}
+					}
+					kv.notification[opeartion.ClientID] = newNotify
+				case CommandTypeGet:
+					for _, v := range kv.notification[opeartion.ClientID] {
+						// if v.typ != "Get" {
+						// 	continue
+						// }
+						if apply.CommandTerm != v.term {
+							v.notify <- notify{
+								NoLeader: true,
+							}
+						} else if v.reqid == opeartion.ReqID {
+							value, ok := kv.data[opeartion.Key]
+							v.notify <- notify{
+								NoLeader: false,
+								Exists:   ok,
+								Value:    value,
+							}
+						} else {
+							newNotify = append(newNotify, v)
+						}
+					}
+					kv.notification[opeartion.ClientID] = newNotify
+				}
+
+				kv.lastAppliedIndex++
+
+				// 此处检查raft state的size
+				if kv.maxraftstate > 0 {
+					if kv.rf.GetRaftStateSize() > int64(kv.maxraftstate) {
+						dPrintf("[server%v poller] check state size too large(max=%v), snapshoting, size=%v",
+							kv.me, kv.maxraftstate, kv.rf.GetRaftStateSize())
+						buf := bytes.Buffer{}
+						err := labgob.NewEncoder(&buf).Encode(kv.data)
+						if err != nil {
+							panic(err)
+						}
+						err = labgob.NewEncoder(&buf).Encode(kv.lastAppliedReq)
+						if err != nil {
+							panic(err)
+						}
+
+						dPrintf("[server%v poller] after encode, size=%v", kv.me, buf.Len())
+
+						kv.rf.Snapshot(int(kv.lastAppliedIndex), buf.Bytes())
+						dPrintf("[server%v poller] now snapshot length is %v", kv.me, kv.rf.GetRaftStateSize())
+					}
+				}
+			} else {
+				if !apply.SnapshotValid {
+					panic("checkme")
+				}
+
+				dPrintf("[server%v poller] got snapshot apply", kv.me)
+				// 此时应当应用这个snapshot, 然后通知所有等待方no leader
+				dec := labgob.NewDecoder(bytes.NewReader(apply.Snapshot))
+				err := dec.Decode(&kv.data)
+				if err != nil {
+					panic("unexpected")
+				}
+				err = dec.Decode(&kv.lastAppliedReq)
+				if err != nil {
+					panic("unexpected")
+				}
+
+				// 3
+				// 1 2 3 0
+				// 0 2 1
+				// 一旦接收到snapshot就通知所有的等待方no leader
+				for _, v := range kv.notification {
+					for _, c := range v {
+						c.notify <- notify{
+							NoLeader: true,
+						}
+					}
+				}
+				kv.notification = make(map[int][]notifyStruct)
+				kv.lastAppliedIndex = int64(apply.SnapshotIndex)
+				dPrintf("[server%v poller] after got snapshot, now data is %v, lastAppliedIndex = %v", kv.me, kv.data, kv.lastAppliedIndex)
 			}
 
-			// 做通知
-			newNotify := make([]notifyStruct, 0)
-			dPrintf("[server%v poller] iter notifaction is %v", kv.me, kv.notification)
-			switch opeartion.Type {
-			case CommandTypeAppend, CommandTypePut:
-				for _, v := range kv.notification[opeartion.ClientID] {
-					if v.typ != "Put" && v.typ != "Append" {
-						continue
-					}
-					if apply.CommandTerm > v.term {
-						v.notify <- putAppendNotify{
-							NoLeader: true,
-						}
-					} else if v.reqid == opeartion.ReqID {
-						v.notify <- putAppendNotify{
-							NoLeader: false,
-						}
-					} else {
-						newNotify = append(newNotify, v)
-					}
-				}
-				kv.notification[opeartion.ClientID] = newNotify
-			case CommandTypeGet:
-				for _, v := range kv.notification[opeartion.ClientID] {
-					if v.typ != "Get" {
-						continue
-					}
-					if apply.CommandTerm > v.term {
-						v.notify <- getNotify{
-							NoLeader: true,
-						}
-					} else if v.reqid == opeartion.ReqID {
-						value, ok := kv.data[opeartion.Key]
-						v.notify <- getNotify{
-							NoLeader: false,
-							Exists:   ok,
-							Value:    value,
-						}
-					} else {
-						newNotify = append(newNotify, v)
-					}
-				}
-				kv.notification[opeartion.ClientID] = newNotify
-			}
 			kv.mu.Unlock()
 		}
 	}

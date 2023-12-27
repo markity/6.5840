@@ -85,12 +85,14 @@ func (ck *Clerk) Get(key string) string {
 		case result := <-c:
 			switch result.Err {
 			case OK:
+				dPrintf("[clerk%v] get response", ck.clientID)
 				return result.Value
 			case ErrNoKey:
 				return ""
 			case ErrWrongLeader, ErrNetworkNotOK:
 				ck.changeLeader()
 				time.Sleep(time.Millisecond)
+				dPrintf("[clerk%v] get retry", ck.clientID)
 				continue
 			default:
 				panic("checkme")
@@ -137,10 +139,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		case result := <-c:
 			switch result.Err {
 			case OK:
+				dPrintf("[clerk%v] PutAppend return", ck.clientID)
 				return
 			case ErrWrongLeader, ErrNetworkNotOK:
 				ck.changeLeader()
 				time.Sleep(time.Millisecond)
+				dPrintf("[clerk%v] PutAppend retry", ck.clientID)
 				continue
 			default:
 				panic("checkme")
