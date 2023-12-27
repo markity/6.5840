@@ -131,12 +131,6 @@ func (rf *Raft) debug(format string, args ...interface{}) {
 	}
 }
 
-func (rf *Raft) debugForce(format string, args ...interface{}) {
-	s := fmt.Sprintf("%v(%v term=%v): ", rf.me, rf.state.State, rf.state.Term)
-	s += format + "\n"
-	log.Printf(s, args...)
-}
-
 func (rf *Raft) randElectionTimer() {
 	t := time.Millisecond*LEADER_ELECTION_TIMEOUT_LOW +
 		time.Millisecond*time.Duration(
@@ -478,7 +472,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func stateMachine(rf *Raft) {
 	p := PersistInfo{}
 	labgob.NewDecoder(bytes.NewReader(rf.persister.ReadRaftState())).Decode(&p)
-	log.Printf("%v read from disk comfirm2: %v\n", rf.me, p.LastIncludedIndex)
 
 	rf.readPersist(rf.persister.ReadRaftState())
 	if doDebug {
@@ -503,7 +496,6 @@ func stateMachine(rf *Raft) {
 			SnapshotIndex: rf.state.LastIncludedIndex,
 		})
 	}
-	rf.debugForce("startup LasIncIndex=%v", rf.state.LastIncludedIndex)
 
 	for {
 		select {
@@ -592,8 +584,6 @@ func stateMachine(rf *Raft) {
 				rf.state.LastIncludedIndex = l.LogIndex
 				rf.state.LastIncludedTerm = l.LogTerm
 				rf.persist(info.SnapShot)
-				rf.debugForce("got snapshot info: index=%v now logs=%v lastIncIdx=%v lastIncTerm=%v",
-					info.Index, rf.state.Logs, rf.state.LastIncludedIndex, rf.state.LastIncludedTerm)
 
 				info.SnapshotOKChan <- struct{}{}
 			case <-rf.reqDead:
@@ -1076,8 +1066,7 @@ func stateMachine(rf *Raft) {
 
 					// 如果没有preLog的话直接拒绝日志, ConflictIndex = -1
 					rf.debug("preLogIndex=%v", val.PrevLogIndex)
-					// 1258 [1259 1260 1261 1262 1263 1264]
-					// 1264
+
 					if val.PrevLogIndex+len(entries) <= rf.state.CommitIndex {
 						go func(t int) {
 							rf.sendAppendEntriesReply(val.LeaderID, &appendEntriesReply{
@@ -1107,8 +1096,6 @@ func stateMachine(rf *Raft) {
 						break
 					}
 
-					// 1258 [1259 1260 1261]
-					// 1260
 					preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
 					if !ok {
 						fmt.Println(rf.state.LastIncludedIndex, val.PrevLogIndex)
@@ -1122,8 +1109,8 @@ func stateMachine(rf *Raft) {
 						}
 					}
 
-					// 如果已经拥有preLog, 那么需要检查是否应该丢弃log
-					// preLog匹配不上, 要求leader回溯
+					// 如果已经拥有preLog对应得index, 那么需要检查是否应该丢弃log
+					// preLog匹配不上, 则删除preLog及其之后的所有, 要求leader回溯
 					if preLog.LogTerm != val.PreLogTerm {
 						conflictTerm := rf.state.Logs.GetByIndex(val.PrevLogIndex).LogTerm
 						i := val.PrevLogIndex - rf.state.Logs[0].LogIndex

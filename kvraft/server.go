@@ -303,7 +303,6 @@ func poller(kv *KVServer) {
 						}
 
 						dPrintf("[server%v poller] after encode, size=%v", kv.me, buf.Len())
-
 						kv.rf.Snapshot(int(kv.lastAppliedIndex), buf.Bytes())
 						dPrintf("[server%v poller] now snapshot length is %v", kv.me, kv.rf.GetRaftStateSize())
 					}

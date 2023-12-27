@@ -7,9 +7,9 @@ import (
 )
 
 type LogEntry struct {
-	LogTerm  int         `json:"log_term"`
-	LogIndex int         `json:"log_index"`
-	Command  interface{} `json:"command"`
+	LogTerm  int
+	LogIndex int
+	Command  interface{}
 }
 
 func (le *LogEntry) ToBytes() []byte {
