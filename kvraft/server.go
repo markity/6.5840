@@ -194,7 +194,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1024)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.notification = make(map[int][]notifyStruct)
 	kv.lastAppliedReq = make(map[int]op)
@@ -220,124 +220,142 @@ func poller(kv *KVServer) {
 		case apply := <-kv.applyCh:
 			dPrintf("[server%v poller] applyCh got %v", kv.me, apply)
 
+			// 为了效率, 一次性读出所有apply进行批量处理
+			applies := make([]raft.ApplyMsg, 0, 1)
+			applies = append(applies, apply)
+			flag := false
+			for {
+				select {
+				case app := <-kv.applyCh:
+					applies = append(applies, app)
+				default:
+					flag = true
+				}
+
+				if flag {
+					break
+				}
+			}
+
 			kv.mu.Lock()
 
-			if apply.CommandValid {
-				dPrintf("[server%v poller] got command apply", kv.me)
+			for _, apply := range applies {
+				if apply.CommandValid {
+					dPrintf("[server%v poller] got command apply %v", kv.me, apply.CommandIndex)
+					opeartion := apply.Command.(op)
 
-				opeartion := apply.Command.(op)
+					// 保证幂等
+					if opeartion.ReqID > kv.lastAppliedReq[opeartion.ClientID].ReqID {
+						kv.lastAppliedReq[opeartion.ClientID] = opeartion
+						switch opeartion.Type {
+						case CommandTypeAppend:
+							kv.data[opeartion.Key] = kv.data[opeartion.Key] + opeartion.Data
+							dPrintf("got append now data is: %v", kv.data)
+						case CommandTypeGet:
+							// DO NOTHING
+						case CommandTypePut:
+							kv.data[opeartion.Key] = opeartion.Data
+						}
+					}
 
-				// 保证幂等
-				if opeartion.ReqID > kv.lastAppliedReq[opeartion.ClientID].ReqID {
-					kv.lastAppliedReq[opeartion.ClientID] = opeartion
+					// 做通知
+					newNotify := make([]notifyStruct, 0)
 					switch opeartion.Type {
-					case CommandTypeAppend:
-						kv.data[opeartion.Key] = kv.data[opeartion.Key] + opeartion.Data
-						dPrintf("got append now data is: %v", kv.data)
+					case CommandTypeAppend, CommandTypePut:
+						for _, v := range kv.notification[opeartion.ClientID] {
+							// if v.typ != "Put" && v.typ != "Append" {
+							// 	continue
+							// }
+							if apply.CommandTerm != v.term {
+								v.notify <- notify{
+									NoLeader: true,
+								}
+							} else if v.reqid == opeartion.ReqID {
+								v.notify <- notify{
+									NoLeader: false,
+								}
+							} else {
+								newNotify = append(newNotify, v)
+							}
+						}
+						kv.notification[opeartion.ClientID] = newNotify
 					case CommandTypeGet:
-						// DO NOTHING
-					case CommandTypePut:
-						kv.data[opeartion.Key] = opeartion.Data
+						for _, v := range kv.notification[opeartion.ClientID] {
+							// if v.typ != "Get" {
+							// 	continue
+							// }
+							if apply.CommandTerm != v.term {
+								v.notify <- notify{
+									NoLeader: true,
+								}
+							} else if v.reqid == opeartion.ReqID {
+								value, ok := kv.data[opeartion.Key]
+								v.notify <- notify{
+									NoLeader: false,
+									Exists:   ok,
+									Value:    value,
+								}
+							} else {
+								newNotify = append(newNotify, v)
+							}
+						}
+						kv.notification[opeartion.ClientID] = newNotify
 					}
-				}
 
-				// 做通知
-				newNotify := make([]notifyStruct, 0)
-				switch opeartion.Type {
-				case CommandTypeAppend, CommandTypePut:
-					for _, v := range kv.notification[opeartion.ClientID] {
-						// if v.typ != "Put" && v.typ != "Append" {
-						// 	continue
-						// }
-						if apply.CommandTerm != v.term {
-							v.notify <- notify{
+					kv.lastAppliedIndex++
+				} else {
+					if !apply.SnapshotValid {
+						panic("checkme")
+					}
+
+					dPrintf("[server%v poller] got snapshot apply", kv.me)
+					// 此时应当应用这个snapshot, 然后通知所有等待方no leader
+					dec := labgob.NewDecoder(bytes.NewReader(apply.Snapshot))
+					err := dec.Decode(&kv.data)
+					if err != nil {
+						panic("unexpected")
+					}
+					err = dec.Decode(&kv.lastAppliedReq)
+					if err != nil {
+						panic("unexpected")
+					}
+
+					// 3
+					// 1 2 3 0
+					// 0 2 1
+					// 一旦接收到snapshot就通知所有的等待方no leader
+					for _, v := range kv.notification {
+						for _, c := range v {
+							c.notify <- notify{
 								NoLeader: true,
 							}
-						} else if v.reqid == opeartion.ReqID {
-							v.notify <- notify{
-								NoLeader: false,
-							}
-						} else {
-							newNotify = append(newNotify, v)
 						}
 					}
-					kv.notification[opeartion.ClientID] = newNotify
-				case CommandTypeGet:
-					for _, v := range kv.notification[opeartion.ClientID] {
-						// if v.typ != "Get" {
-						// 	continue
-						// }
-						if apply.CommandTerm != v.term {
-							v.notify <- notify{
-								NoLeader: true,
-							}
-						} else if v.reqid == opeartion.ReqID {
-							value, ok := kv.data[opeartion.Key]
-							v.notify <- notify{
-								NoLeader: false,
-								Exists:   ok,
-								Value:    value,
-							}
-						} else {
-							newNotify = append(newNotify, v)
-						}
+					kv.notification = make(map[int][]notifyStruct)
+					kv.lastAppliedIndex = int64(apply.SnapshotIndex)
+					dPrintf("[server%v poller] after got snapshot, now data is %v, lastAppliedIndex = %v", kv.me, kv.data, kv.lastAppliedIndex)
+				}
+			}
+
+			// 此处检查raft state的size
+			if kv.maxraftstate > 0 {
+				if kv.rf.GetRaftStateSize() > int64(kv.maxraftstate) {
+					dPrintf("[server%v poller] check state size too large(max=%v), snapshoting, size=%v",
+						kv.me, kv.maxraftstate, kv.rf.GetRaftStateSize())
+					buf := bytes.Buffer{}
+					err := labgob.NewEncoder(&buf).Encode(kv.data)
+					if err != nil {
+						panic(err)
 					}
-					kv.notification[opeartion.ClientID] = newNotify
-				}
-
-				kv.lastAppliedIndex++
-
-				// 此处检查raft state的size
-				if kv.maxraftstate > 0 {
-					if kv.rf.GetRaftStateSize() > int64(kv.maxraftstate) {
-						dPrintf("[server%v poller] check state size too large(max=%v), snapshoting, size=%v",
-							kv.me, kv.maxraftstate, kv.rf.GetRaftStateSize())
-						buf := bytes.Buffer{}
-						err := labgob.NewEncoder(&buf).Encode(kv.data)
-						if err != nil {
-							panic(err)
-						}
-						err = labgob.NewEncoder(&buf).Encode(kv.lastAppliedReq)
-						if err != nil {
-							panic(err)
-						}
-
-						dPrintf("[server%v poller] after encode, size=%v", kv.me, buf.Len())
-						kv.rf.Snapshot(int(kv.lastAppliedIndex), buf.Bytes())
-						dPrintf("[server%v poller] now snapshot length is %v", kv.me, kv.rf.GetRaftStateSize())
+					err = labgob.NewEncoder(&buf).Encode(kv.lastAppliedReq)
+					if err != nil {
+						panic(err)
 					}
-				}
-			} else {
-				if !apply.SnapshotValid {
-					panic("checkme")
-				}
 
-				dPrintf("[server%v poller] got snapshot apply", kv.me)
-				// 此时应当应用这个snapshot, 然后通知所有等待方no leader
-				dec := labgob.NewDecoder(bytes.NewReader(apply.Snapshot))
-				err := dec.Decode(&kv.data)
-				if err != nil {
-					panic("unexpected")
+					dPrintf("[server%v poller] after encode, size=%v", kv.me, buf.Len())
+					kv.rf.Snapshot(int(kv.lastAppliedIndex), buf.Bytes())
+					dPrintf("[server%v poller] now snapshot length is %v", kv.me, kv.rf.GetRaftStateSize())
 				}
-				err = dec.Decode(&kv.lastAppliedReq)
-				if err != nil {
-					panic("unexpected")
-				}
-
-				// 3
-				// 1 2 3 0
-				// 0 2 1
-				// 一旦接收到snapshot就通知所有的等待方no leader
-				for _, v := range kv.notification {
-					for _, c := range v {
-						c.notify <- notify{
-							NoLeader: true,
-						}
-					}
-				}
-				kv.notification = make(map[int][]notifyStruct)
-				kv.lastAppliedIndex = int64(apply.SnapshotIndex)
-				dPrintf("[server%v poller] after got snapshot, now data is %v, lastAppliedIndex = %v", kv.me, kv.data, kv.lastAppliedIndex)
 			}
 
 			kv.mu.Unlock()
