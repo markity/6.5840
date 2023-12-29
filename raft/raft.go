@@ -30,11 +30,9 @@ type Raft struct {
 	reqDeadOK chan struct{}
 
 	// 异步获取当前状态, 我写的代码是状态机, 最好不用锁, 不侵入状态机的状态, 通过请求打入状态机器循环
-	reqGetState  chan struct{}
-	getStateChan chan GetStateInfo
+	reqGetState chan chan GetStateInfo
 
-	reqGetRaftStateSizeChan chan struct{}
-	getRaftStateSizeChan    chan int64
+	reqGetRaftStateSizeChan chan chan int64
 
 	// 发送命令的Channel, 以及反馈结果的管道
 	sendCmdChan chan SendCmdChanInfo
@@ -45,7 +43,6 @@ type Raft struct {
 	snapshotChan chan DoSnapshotInfo
 
 	// apply相关的设施
-	applyCh    chan ApplyMsg
 	applyQueue *unboundedQueue
 
 	// 只有一个timer
@@ -58,15 +55,17 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	rf.reqGetState <- struct{}{}
-	s := <-rf.getStateChan
+	c := make(chan GetStateInfo)
+	rf.reqGetState <- c
+	s := <-c
 
 	return s.Term, s.Isleader
 }
 
 func (rf *Raft) GetRaftStateSize() int64 {
-	rf.reqGetRaftStateSizeChan <- struct{}{}
-	s := <-rf.getRaftStateSizeChan
+	c := make(chan int64)
+	rf.reqGetRaftStateSizeChan <- c
+	s := <-c
 
 	return s
 }
@@ -431,16 +430,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.reqDead = make(chan struct{})
-	rf.reqGetState = make(chan struct{})
-	rf.getStateChan = make(chan GetStateInfo)
+	rf.reqGetState = make(chan chan GetStateInfo)
 	rf.messagePipeLine = make(chan Message)
 	rf.sendCmdChan = make(chan SendCmdChanInfo)
-	rf.applyCh = applyCh
 	rf.applyQueue = newUnboundedQueue()
 	rf.reqDeadOK = make(chan struct{})
 	rf.snapshotChan = make(chan DoSnapshotInfo)
-	rf.getRaftStateSizeChan = make(chan int64)
-	rf.reqGetRaftStateSizeChan = make(chan struct{})
+	rf.reqGetRaftStateSizeChan = make(chan chan int64)
 
 	go func() {
 		for {
@@ -565,10 +561,10 @@ func stateMachine(rf *Raft) {
 			}
 		default:
 			select {
-			case <-rf.reqGetRaftStateSizeChan:
+			case c := <-rf.reqGetRaftStateSizeChan:
 				sz := rf.persister.RaftStateSize()
 				go func() {
-					rf.getRaftStateSizeChan <- int64(sz)
+					c <- int64(sz)
 				}()
 			case info := <-rf.snapshotChan:
 				rf.debug("got snapshot command, idx=%v logs=%v", info.Index, rf.state.Logs)
@@ -597,10 +593,10 @@ func stateMachine(rf *Raft) {
 					}
 				}()
 				return
-			case <-rf.reqGetState:
+			case c := <-rf.reqGetState:
 				rf.debug("rf.reqGetState")
 				go func(t int, isLeader bool) {
-					rf.getStateChan <- GetStateInfo{
+					c <- GetStateInfo{
 						Term:     t,
 						Isleader: isLeader,
 					}
