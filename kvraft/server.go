@@ -47,10 +47,10 @@ type KVServer struct {
 	mu sync.Mutex
 	// clientID -> reqID的映射, 防止client重复发送
 	// 当op == nil时代表已经start进去了, 但是还没被apply, 需要等在channel上
-	lastAppliedReq   map[int]op
-	notification     map[int][]notifyStruct
-	lastAppliedIndex int64
-	data             map[string]string
+	duplicatedReqTable map[int]reqCache
+	notification       map[int][]notifyStruct
+	lastAppliedIndex   int64
+	data               map[string]string
 }
 
 type notifyStruct struct {
@@ -64,6 +64,16 @@ type notify struct {
 	NoLeader bool
 
 	// useful for get notify
+	Exists bool
+	Value  string
+}
+
+type reqCache struct {
+	Reqid     int64
+	CacheData interface{}
+}
+
+type getCache struct {
 	Exists bool
 	Value  string
 }
@@ -187,6 +197,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	dPrintf("server Start")
 
 	labgob.Register(op{})
+	labgob.Register(getCache{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -197,7 +208,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg, 1024)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.notification = make(map[int][]notifyStruct)
-	kv.lastAppliedReq = make(map[int]op)
+	kv.duplicatedReqTable = make(map[int]reqCache)
 	kv.data = make(map[string]string)
 	kv.deadReq = make(chan struct{})
 	kv.deadOk = make(chan struct{})
@@ -244,17 +255,32 @@ func poller(kv *KVServer) {
 					dPrintf("[server%v poller] got command apply %v", kv.me, apply.CommandIndex)
 					opeartion := apply.Command.(op)
 
-					// 保证幂等
-					if opeartion.ReqID > kv.lastAppliedReq[opeartion.ClientID].ReqID {
-						kv.lastAppliedReq[opeartion.ClientID] = opeartion
+					// 保证幂等, 不重复执行命令, 并缓存此次执行的返回值以及lastReqid, 用duplicatedReqTable存
+					if opeartion.ReqID > kv.duplicatedReqTable[opeartion.ClientID].Reqid {
 						switch opeartion.Type {
 						case CommandTypeAppend:
 							kv.data[opeartion.Key] = kv.data[opeartion.Key] + opeartion.Data
+							kv.duplicatedReqTable[opeartion.ClientID] = reqCache{
+								Reqid:     opeartion.ReqID,
+								CacheData: nil,
+							}
 							dPrintf("got append now data is: %v", kv.data)
 						case CommandTypeGet:
 							// DO NOTHING
+							value, ok := kv.data[opeartion.Key]
+							kv.duplicatedReqTable[opeartion.ClientID] = reqCache{
+								Reqid: opeartion.ReqID,
+								CacheData: getCache{
+									Exists: ok,
+									Value:  value,
+								},
+							}
 						case CommandTypePut:
 							kv.data[opeartion.Key] = opeartion.Data
+							kv.duplicatedReqTable[opeartion.ClientID] = reqCache{
+								Reqid:     opeartion.ReqID,
+								CacheData: nil,
+							}
 						}
 					}
 
@@ -289,11 +315,15 @@ func poller(kv *KVServer) {
 									NoLeader: true,
 								}
 							} else if v.reqid == opeartion.ReqID {
-								value, ok := kv.data[opeartion.Key]
+								// 改进这里, 需要缓存之前的response, 这样比较优雅, 否则会发生这种情况
+								//		Client Get(Reqid = 32) 2
+								//		Client Get(Reqid = 32) 8
+								// 		duplicated Get is not eq, 很不优雅
+								cache := kv.duplicatedReqTable[opeartion.ClientID].CacheData.(getCache)
 								v.notify <- notify{
 									NoLeader: false,
-									Exists:   ok,
-									Value:    value,
+									Exists:   cache.Exists,
+									Value:    cache.Value,
 								}
 							} else {
 								newNotify = append(newNotify, v)
@@ -315,7 +345,7 @@ func poller(kv *KVServer) {
 					if err != nil {
 						panic("unexpected")
 					}
-					err = dec.Decode(&kv.lastAppliedReq)
+					err = dec.Decode(&kv.duplicatedReqTable)
 					if err != nil {
 						panic("unexpected")
 					}
@@ -347,7 +377,7 @@ func poller(kv *KVServer) {
 					if err != nil {
 						panic(err)
 					}
-					err = labgob.NewEncoder(&buf).Encode(kv.lastAppliedReq)
+					err = labgob.NewEncoder(&buf).Encode(kv.duplicatedReqTable)
 					if err != nil {
 						panic(err)
 					}

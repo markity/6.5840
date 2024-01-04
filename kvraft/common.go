@@ -1,6 +1,6 @@
 package kvraft
 
-const debug = true
+const debug = false
 
 const (
 	OK             = "OK"

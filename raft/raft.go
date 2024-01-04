@@ -26,8 +26,7 @@ type Raft struct {
 	me int
 
 	// 自己用channel做退出
-	reqDead   chan struct{}
-	reqDeadOK chan struct{}
+	reqDead chan chan struct{}
 
 	// 异步获取当前状态, 我写的代码是状态机, 最好不用锁, 不侵入状态机的状态, 通过请求打入状态机器循环
 	reqGetState chan chan GetStateInfo
@@ -148,103 +147,6 @@ func (rf *Raft) timerTimeout() {
 	rf.debug("make timer timeout")
 }
 
-type empty struct{}
-
-type requestVoteRequest struct {
-	Term         int
-	CandidateID  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type requestVoteReply struct {
-	ReqTerm     int
-	Term        int
-	VoteGranted bool
-}
-
-// 心跳: AppendEntries RPCs that carry no log entries is heartbeat
-type appendEntriesRequest struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PreLogTerm   int
-	// may send more than one for efficiency
-	// empty for heartbeat
-	Entries      [][]byte
-	LeaderCommit int
-}
-
-type appendEntriesReply struct {
-	ID             int
-	ReqTerm        int
-	Term           int
-	PreIndex       int
-	Success        bool
-	NLogsInRequest int
-	// 实现简化版本的快速回退
-	ConflictIndex int
-}
-
-type installSnapshotRequest struct {
-	Term              int
-	LeaderID          int
-	LastIncludedIndex int
-	LastIncludedTerm  int
-	Snapshot          []byte
-}
-
-type installSnapshotReply struct {
-	ReqTerm              int
-	ReqLastIncludedIndex int
-	ReqLastIncludedTerm  int
-	ID                   int
-	Term                 int
-}
-
-// 外部调用, 会进入这里来
-func (rf *Raft) RequestVoteReq(args *requestVoteRequest, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
-func (rf *Raft) RequestVoteReply(args *requestVoteReply, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
-func (rf *Raft) AppendEntries(args *appendEntriesRequest, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
-func (rf *Raft) AppendEntriesReply(args *appendEntriesReply, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
-func (rf *Raft) InstallSnapshot(args *installSnapshotRequest, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
-func (rf *Raft) InstallSnapshotReply(args *installSnapshotReply, reply *empty) {
-	rf.messagePipeLine <- Message{
-		Term: args.Term,
-		Msg:  args,
-	}
-}
-
 func (rf *Raft) commit(leaderCommitIndex int, newEntry LogEntry) {
 	if leaderCommitIndex > rf.state.CommitIndex {
 		oldCommitIndex := rf.state.CommitIndex
@@ -254,7 +156,6 @@ func (rf *Raft) commit(leaderCommitIndex int, newEntry LogEntry) {
 			l, ok := rf.state.Logs.FindLogByIndex(i)
 			if !ok {
 				log.Panicf("oldCommitIndex=%v newCommitIndex=%v i = %v logs=%v", oldCommitIndex, rf.state.CommitIndex, i, rf.state.Logs)
-				panic("checkme")
 			}
 			msg := ApplyMsg{
 				CommandValid: true,
@@ -299,7 +200,6 @@ func (rf *Raft) leaderSendLogs(to int) {
 			lastLog := logs.LastLog()
 			preLog, ok := logs.FindLogByIndex(nextIndex[i] - 1)
 			if !ok {
-				fmt.Println(logs, nextIndex)
 				panic("checkme")
 			}
 			if lastLog.LogIndex >= nextIndex[i] {
@@ -343,57 +243,6 @@ func (rf *Raft) leaderSendLogs(to int) {
 	}
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVoteRequest(server int, args *requestVoteRequest) {
-	rf.peers[server].Call("Raft.RequestVoteReq", args, &empty{})
-}
-
-func (rf *Raft) sendRequestVoteReply(server int, args *requestVoteReply) {
-	rf.peers[server].Call("Raft.RequestVoteReply", args, &empty{})
-}
-
-func (rf *Raft) sendAppendEntriesRequest(server int, args *appendEntriesRequest) {
-	rf.peers[server].Call("Raft.AppendEntries", args, &empty{})
-}
-
-func (rf *Raft) sendAppendEntriesReply(server int, args *appendEntriesReply) {
-	rf.peers[server].Call("Raft.AppendEntriesReply", args, &empty{})
-}
-
-func (rf *Raft) sendInstallSnapshotRequest(server int, args *installSnapshotRequest) {
-	rf.peers[server].Call("Raft.InstallSnapshot", args, &empty{})
-}
-
-func (rf *Raft) sendInstallSnapshotReply(server int, args *installSnapshotReply) {
-	rf.peers[server].Call("Raft.InstallSnapshotReply", args, &empty{})
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -419,8 +268,9 @@ func (rf *Raft) Start(command interface{}) (idx int, term int, isLeader bool) {
 }
 
 func (rf *Raft) Kill() {
-	rf.reqDead <- struct{}{}
-	<-rf.reqDeadOK
+	c := make(chan struct{}, 0)
+	rf.reqDead <- c
+	<-c
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -429,12 +279,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.reqDead = make(chan struct{})
+	rf.reqDead = make(chan chan struct{})
 	rf.reqGetState = make(chan chan GetStateInfo)
 	rf.messagePipeLine = make(chan Message)
 	rf.sendCmdChan = make(chan SendCmdChanInfo)
 	rf.applyQueue = newUnboundedQueue()
-	rf.reqDeadOK = make(chan struct{})
 	rf.snapshotChan = make(chan DoSnapshotInfo)
 	rf.reqGetRaftStateSizeChan = make(chan chan int64)
 
@@ -487,7 +336,7 @@ func stateMachine(rf *Raft) {
 		rf.state.CommitIndex = rf.state.LastIncludedIndex
 		rf.applyQueue.Push(ApplyMsg{
 			SnapshotValid: true,
-			Snapshot:      rf.persister.ReadSnapshot(),
+			Snapshot:      snapShot,
 			SnapshotTerm:  rf.state.LastIncludedTerm,
 			SnapshotIndex: rf.state.LastIncludedIndex,
 		})
@@ -582,10 +431,10 @@ func stateMachine(rf *Raft) {
 				rf.persist(info.SnapShot)
 
 				info.SnapshotOKChan <- struct{}{}
-			case <-rf.reqDead:
+			case c := <-rf.reqDead:
 				rf.debug("dead")
-				rf.reqDeadOK <- struct{}{}
-				// 测试用例会在raft dead后发start, 需要避免问题我采取了个折中的方案
+				c <- struct{}{}
+				// FIXME: 测试用例会在raft dead后发start, 需要避免问题我采取了个折中的方案
 				go func() {
 					for {
 						c := <-rf.sendCmdChan
@@ -1094,7 +943,6 @@ func stateMachine(rf *Raft) {
 
 					preLog, ok := rf.state.Logs.FindLogByIndex(val.PrevLogIndex)
 					if !ok {
-						fmt.Println(rf.state.LastIncludedIndex, val.PrevLogIndex)
 						preLogNew := entries[rf.state.LastIncludedIndex-val.PrevLogIndex-1]
 						entries = entries[rf.state.LastIncludedIndex-val.PrevLogIndex:]
 						val.PrevLogIndex = preLogNew.LogIndex

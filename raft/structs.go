@@ -4,7 +4,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-	CommandTerm  int
+	CommandTerm  int // 加上这个玩意是为了方便lab3及时返回给客户端no leader信息
 
 	// For 2D:
 	SnapshotValid bool
@@ -42,12 +42,16 @@ type SendCmdRespInfo struct {
 }
 
 type RaftState struct {
-	State       string
+	// State = follower candidate leader之一
+	State string
+
 	CommitIndex int
 
 	FollowerState
 	CandidateState
 	LeaderState
+
+	// 带有需要持久化的状态, 里面的内容一旦改变就persist
 	PersistInfo
 }
 
